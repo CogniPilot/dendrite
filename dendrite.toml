@@ -1,0 +1,20 @@
+[daemon]
+bind = "0.0.0.0:8080"
+heartbeat_interval_secs = 2    # Lightweight ARP/ping check every 2 seconds
+# MCUmgr scans run on startup and via GUI "Scan Network" button only
+
+[discovery]
+subnet = "192.0.2.0"
+prefix_len = 24
+mcumgr_port = 1337
+use_lldp = true
+use_arp = true
+
+[fragments]
+path = "./fragments/index.toml"
+
+[models]
+path = "./assets/models"
+
+[hcdf]
+path = "./dendrite.hcdf"

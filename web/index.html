@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="icon" type="image/svg+xml" href="dendrite-logo.svg">
+    <title>Dendrite - CogniPilot Hardware Visualization</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            /* Prevent pull-to-refresh on mobile */
+            overscroll-behavior: none;
+            /* Prevent text selection on touch */
+            -webkit-user-select: none;
+            user-select: none;
+            /* Prevent tap highlight on mobile */
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        #dendrite-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            /* Prevent touch actions that interfere with the app */
+            touch-action: none;
+        }
+
+        #loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #1a1a2e;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: #eee;
+            z-index: 1000;
+            transition: opacity 0.5s;
+        }
+
+        #loading.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .logo-image {
+            width: 120px;
+            height: 120px;
+            margin-bottom: 20px;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.8; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.05); }
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid #333;
+            border-top: 3px solid #4a9eff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #4a9eff;
+        }
+
+        .status {
+            font-size: 14px;
+            color: #888;
+        }
+
+        /* WebGPU not supported fallback */
+        #webgpu-error {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #1a1a2e;
+            color: #eee;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 20px;
+            z-index: 1001;
+        }
+
+        #webgpu-error h1 {
+            color: #ff6b6b;
+            margin-bottom: 20px;
+        }
+
+        #webgpu-error p {
+            max-width: 500px;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <img src="dendrite-logo.svg" alt="Dendrite Logo" class="logo-image">
+        <div class="spinner"></div>
+        <div class="logo">Dendrite</div>
+        <div class="status">Loading hardware visualization...</div>
+    </div>
+
+    <div id="webgpu-error">
+        <div>
+            <h1>WebGPU Not Supported</h1>
+            <p>
+                Your browser doesn't support WebGPU, which is required for Dendrite's 3D visualization.
+                Please use a modern browser like Chrome 113+, Edge 113+, or Firefox Nightly with WebGPU enabled.
+            </p>
+        </div>
+    </div>
+
+    <canvas id="dendrite-canvas"></canvas>
+
+    <script type="module">
+        // Prevent default middle mouse button behavior (auto-scroll)
+        const canvas = document.getElementById('dendrite-canvas');
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button === 1) { // Middle mouse button
+                e.preventDefault();
+            }
+        });
+        canvas.addEventListener('auxclick', (e) => {
+            if (e.button === 1) {
+                e.preventDefault();
+            }
+        });
+        // Prevent context menu on right-click
+        canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Load WASM module (using WebGL2 for broad compatibility)
+        // Add cache buster to force reload
+        const cacheBuster = new Date().getTime();
+        import(`./pkg/dendrite_web.js?v=${cacheBuster}`).then(async (module) => {
+            await module.default();
+            // Hide loading screen after init
+            setTimeout(() => {
+                document.getElementById('loading').classList.add('hidden');
+            }, 500);
+        }).catch(err => {
+            // Bevy/wasm-bindgen uses exceptions for control flow - ignore these
+            if (err.message && err.message.includes("Using exceptions for control flow")) {
+                console.log('Bevy initialized (ignore the exception message)');
+                setTimeout(() => {
+                    document.getElementById('loading').classList.add('hidden');
+                }, 500);
+                return;
+            }
+            console.error('Failed to load WASM module:', err);
+            document.querySelector('.status').textContent = 'Failed to load: ' + err.message;
+            document.querySelector('.status').style.color = '#ff6b6b';
+        });
+    </script>
+</body>
+</html>

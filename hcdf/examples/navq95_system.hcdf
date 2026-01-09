@@ -1,0 +1,45 @@
+<?xml version='1.0'?>
+<hcdf version="1.2">
+    <!-- Parent device: NavQ95 with T1 Ethernet switch -->
+    <comp name="navq95" role="parent">
+        <pose_cg>0 0 0 0 0 0</pose_cg>
+        <mass>0.085</mass>
+        <board>imx95-navq</board>
+        <software name="linux">
+            <version>6.6</version>
+        </software>
+        <network>
+            <interface name="eth0" type="t1" ports="6">
+                <switch chip="sja1105"/>
+            </interface>
+        </network>
+        <model href="models/navq95.glb"/>
+    </comp>
+
+    <!-- Example child device: Spinali flight controller -->
+    <mcu name="spinali-001" hwid="0x12345678abcdef">
+        <pose_cg>0.1 0 0 0 0 0</pose_cg>
+        <mass>0.025</mass>
+        <board>spinali</board>
+        <software name="cerebri">
+            <version>1.0.0</version>
+            <hash>abc123def456...</hash>
+        </software>
+        <discovered>
+            <ip>192.168.186.10</ip>
+            <port>2</port>
+            <last_seen>2026-01-07T12:00:00Z</last_seen>
+        </discovered>
+        <model href="models/spinali.glb"/>
+    </mcu>
+
+    <!-- T1 Ethernet link from navq95 port 2 to spinali -->
+    <link name="navq95_to_spinali">
+        <digital name="t1_eth">
+            <wired name="100base-t1">
+                <from>navq95/eth0:2</from>
+                <to>spinali-001/eth0</to>
+            </wired>
+        </digital>
+    </link>
+</hcdf>

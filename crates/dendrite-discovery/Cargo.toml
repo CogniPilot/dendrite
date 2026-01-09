@@ -1,0 +1,17 @@
+[package]
+name = "dendrite-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Network discovery (LLDP, ARP, MCUmgr probing) for Dendrite"
+
+[dependencies]
+dendrite-core = { workspace = true }
+dendrite-mcumgr = { workspace = true }
+tokio = { workspace = true }
+pnet = { workspace = true }
+network-interface = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

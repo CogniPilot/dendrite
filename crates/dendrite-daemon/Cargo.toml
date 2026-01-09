@@ -1,0 +1,32 @@
+[package]
+name = "dendrite-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dendrite daemon with web server and REST API"
+
+[[bin]]
+name = "dendrite"
+path = "src/main.rs"
+
+[dependencies]
+dendrite-core = { workspace = true }
+dendrite-mcumgr = { workspace = true }
+dendrite-discovery = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+network-interface = { workspace = true }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls-pemfile = "2"

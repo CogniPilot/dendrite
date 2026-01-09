@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dendrite-core",
+    "crates/dendrite-mcumgr",
+    "crates/dendrite-discovery",
+    "crates/dendrite-daemon",
+    "crates/dendrite-web",
+    "crates/dendrite-qr",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/CogniPilot/dendrite"
+authors = ["CogniPilot <info@cognipilot.org>"]
+
+[workspace.dependencies]
+# Internal crates
+dendrite-core = { path = "crates/dendrite-core" }
+dendrite-mcumgr = { path = "crates/dendrite-mcumgr" }
+dendrite-discovery = { path = "crates/dendrite-discovery" }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = { version = "0.37", features = ["serialize"] }
+toml = "0.8"
+
+# Web server
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Networking
+pnet = "0.35"
+network-interface = "2.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
