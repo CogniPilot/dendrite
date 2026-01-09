@@ -57,6 +57,10 @@ jobs:
           mkdir -p web/pkg
           wasm-bindgen --out-dir web/pkg --target web --no-typescript target/wasm32-unknown-unknown/release/dendrite_web.wasm
 
+      - name: Copy assets
+        run: |
+          cp -r assets/models web/models
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
