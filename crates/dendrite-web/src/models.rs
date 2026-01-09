@@ -12,7 +12,8 @@ pub struct ModelsPlugin;
 impl Plugin for ModelsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ModelCache>()
-            .add_systems(Update, (load_models, sync_device_entities).chain());
+            .add_systems(Update, load_models)
+            .add_systems(Update, sync_device_entities.after(load_models));
     }
 }
 
@@ -91,7 +92,7 @@ fn sync_device_entities(
     // Remove devices no longer in registry
     for (id, entity) in &existing_ids {
         if id != "parent" && !registry_ids.contains(id) {
-            commands.entity(*entity).despawn_recursive();
+            commands.entity(*entity).despawn();
         }
     }
 

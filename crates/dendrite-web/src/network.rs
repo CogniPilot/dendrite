@@ -15,8 +15,6 @@ pub struct DaemonConfig {
     pub http_url: String,
     /// WebSocket URL (e.g., "ws://192.168.1.100:8080/ws")
     pub ws_url: String,
-    /// Whether connection is configured (vs using same-origin)
-    pub is_remote: bool,
 }
 
 impl Default for DaemonConfig {
@@ -24,7 +22,6 @@ impl Default for DaemonConfig {
         Self {
             http_url: String::new(),
             ws_url: String::new(),
-            is_remote: false,
         }
     }
 }
@@ -51,7 +48,6 @@ impl DaemonConfig {
         Self {
             http_url: format!("{}://{}", if is_https { "https" } else { "http" }, host),
             ws_url: format!("{}://{}/ws", if is_https { "wss" } else { "ws" }, host),
-            is_remote: false,
         }
     }
 
@@ -70,7 +66,6 @@ impl DaemonConfig {
         Self {
             http_url,
             ws_url,
-            is_remote: true,
         }
     }
 
@@ -113,8 +108,9 @@ pub struct NetworkInterfaces {
     pub scan_in_progress: bool,
 }
 
-/// Request to update subnet
+/// Request to update subnet (used by trigger_scan_on_interface)
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct UpdateSubnetRequest {
     subnet: String,
     prefix_len: u8,
@@ -130,7 +126,7 @@ impl Plugin for NetworkPlugin {
             .init_resource::<PendingMessages>()
             .init_resource::<NetworkInterfaces>()
             .init_resource::<PendingInterfaceData>()
-            .add_event::<ReconnectEvent>()
+            .add_message::<ReconnectEvent>()
             .add_systems(Startup, (connect_websocket, fetch_initial_devices, fetch_network_interfaces))
             .add_systems(Update, (process_messages, process_interface_data, handle_reconnect));
     }
@@ -138,7 +134,7 @@ impl Plugin for NetworkPlugin {
 
 /// Handle reconnection events
 fn handle_reconnect(
-    mut events: EventReader<ReconnectEvent>,
+    mut events: MessageReader<ReconnectEvent>,
     mut daemon_config: ResMut<DaemonConfig>,
     mut connection: ResMut<WebSocketConnection>,
     pending: Res<PendingMessages>,
@@ -290,11 +286,10 @@ pub struct PendingMessages(pub Arc<Mutex<Vec<WsMessage>>>);
 #[derive(Resource, Default)]
 pub struct WebSocketConnection {
     pub connected: bool,
-    pub messages: Vec<WsMessage>,
 }
 
-/// Event to trigger reconnection with new daemon config
-#[derive(Event)]
+/// Message to trigger reconnection with new daemon config
+#[derive(Message)]
 pub struct ReconnectEvent {
     pub daemon_address: String,
 }
@@ -314,7 +309,12 @@ pub enum WsMessage {
     #[serde(rename = "scan_started")]
     ScanStarted,
     #[serde(rename = "scan_completed")]
-    ScanCompleted { found: usize, total: usize },
+    ScanCompleted {
+        #[allow(dead_code)]
+        found: usize,
+        #[allow(dead_code)]
+        total: usize,
+    },
     #[serde(rename = "pong")]
     Pong,
 }
@@ -337,6 +337,7 @@ pub struct IdJson(pub String);
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiscoveryJson {
     pub ip: String,
+    #[allow(dead_code)]
     pub port: u16,
     pub switch_port: Option<u8>,
 }

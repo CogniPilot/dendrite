@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
-use bevy::render::mesh::MeshAabb;
+use bevy::camera::primitives::MeshAabb;
 use bevy::render::alpha::AlphaMode;
 
 use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, SelectedDevice, WorldSettings};
@@ -37,8 +37,9 @@ pub struct DeviceEntity {
     pub device_id: String,
 }
 
-/// Marker for the parent device
+/// Marker for the parent device (reserved for future use)
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct ParentDevice;
 
 /// Marker for grid lines
@@ -49,8 +50,9 @@ pub struct GridLine;
 #[derive(Component)]
 pub struct WorldAxis;
 
-/// Marker for device connection lines
+/// Marker for device connection lines (reserved for future use)
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct ConnectionLine;
 
 /// Marker for selection highlight box
@@ -71,6 +73,7 @@ pub struct RotationAxisIndicator {
 
 /// Marker for effective rotation axis indicator (shows actual rotation axis for Euler XYZ)
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct EffectiveRotationAxis {
     pub target_device: String,
 }
@@ -101,6 +104,7 @@ fn setup_scene(
     commands.insert_resource(AmbientLight {
         color: Color::srgb(0.9, 0.95, 1.0), // Slightly blue-tinted for realism
         brightness: 200.0, // Much lower for more contrast
+        ..default()
     });
 
     // Directional light (from above in ENU) - like sunlight
@@ -291,15 +295,15 @@ fn setup_scene(
 fn update_camera(
     mut camera_query: Query<&mut Transform, With<MainCamera>>,
     mut settings: ResMut<CameraSettings>,
-    mut mouse_motion: EventReader<MouseMotion>,
-    mut mouse_wheel: EventReader<MouseWheel>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut mouse_wheel: MessageReader<MouseWheel>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     touch_input: Res<Touches>,
     time: Res<Time>,
     mut contexts: bevy_egui::EguiContexts,
 ) {
     // Check if egui wants the mouse - if so, don't process camera controls
-    let egui_wants_pointer = contexts.ctx_mut().wants_pointer_input();
+    let egui_wants_pointer = contexts.ctx_mut().map(|ctx| ctx.wants_pointer_input()).unwrap_or(false);
 
     // Collect mouse motion delta
     let mut total_motion = Vec2::ZERO;
@@ -384,7 +388,7 @@ fn update_camera(
     settings.target = settings.target + (settings.target_focus - settings.target) * lerp_factor;
 
     // Update camera position (ENU: Z is up)
-    if let Ok(mut transform) = camera_query.get_single_mut() {
+    if let Ok(mut transform) = camera_query.single_mut() {
         // Spherical coordinates with Z-up
         let x = settings.distance * settings.azimuth.cos() * settings.elevation.cos();
         let y = settings.distance * settings.azimuth.sin() * settings.elevation.cos();
@@ -417,12 +421,12 @@ fn handle_device_interaction(
     mut touch_state: ResMut<TouchState>,
 ) {
     // Check if egui wants the pointer
-    let egui_wants_pointer = contexts.ctx_mut().wants_pointer_input();
+    let egui_wants_pointer = contexts.ctx_mut().map(|ctx| ctx.wants_pointer_input()).unwrap_or(false);
     if egui_wants_pointer {
         return;
     }
 
-    let window = windows.single();
+    let Ok(window) = windows.single() else { return };
     let mut selection_pos: Option<Vec2> = None;
 
     // Track touch state for tap detection
@@ -462,7 +466,7 @@ fn handle_device_interaction(
 
     // Process selection if we have a position to check
     if let Some(pos) = selection_pos {
-        let (camera, camera_transform) = camera_query.single();
+        let Ok((camera, camera_transform)) = camera_query.single() else { return };
         if let Ok(ray) = camera.viewport_to_world(camera_transform, pos) {
             let mut closest: Option<(f32, String, Vec3)> = None;
 
@@ -557,14 +561,14 @@ fn update_selection_highlight(
     // Remove highlights for devices that are no longer selected
     for (entity, highlight, _) in highlight_query.iter_mut() {
         if selected_id != Some(&highlight.target_device) {
-            commands.entity(entity).despawn_recursive();
+            commands.entity(entity).despawn();
         }
     }
 
     // Remove axis indicators for devices that are no longer selected
     for (entity, axis, _) in axis_query.iter() {
         if selected_id != Some(&axis.target_device) {
-            commands.entity(entity).despawn_recursive();
+            commands.entity(entity).despawn();
         }
     }
 
@@ -669,7 +673,7 @@ fn update_selection_highlight(
 
             // Check children
             if let Ok(children) = children_query.get(entity) {
-                for &child in children.iter() {
+                for child in children.iter() {
                     collect_bounds(child, children_query, mesh_query, mesh_assets, parent_transform, min, max, found);
                 }
             }
@@ -914,11 +918,6 @@ fn update_selection_highlight(
                 let device_pos = transform.translation;
                 let device_rotation = transform.rotation;
 
-                // Body-frame axis directions
-                let body_x = device_rotation * Vec3::X;
-                let body_y = device_rotation * Vec3::Y;
-                let body_z = device_rotation * Vec3::Z;
-
                 // Update all axis indicators
                 // All use device_rotation as base, cones have additional local rotation
                 for (axis_entity, axis, material_handle) in axis_query.iter() {
@@ -1049,7 +1048,7 @@ fn update_effective_rotation_axis(
 ) {
     // Despawn existing effective axis indicators
     for entity in effective_axis_query.iter() {
-        commands.entity(entity).despawn_recursive();
+        commands.entity(entity).despawn();
     }
 
     // Only show when a device is selected and a rotation field is active
@@ -1226,7 +1225,7 @@ fn update_grid_spacing(
 
     // Remove old grid lines
     for entity in grid_query.iter() {
-        commands.entity(entity).despawn_recursive();
+        commands.entity(entity).despawn();
     }
 
     // Create new grid with updated spacing, thickness, and alpha
