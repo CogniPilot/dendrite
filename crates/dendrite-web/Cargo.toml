@@ -9,7 +9,7 @@ description = "WebGPU-powered 3D visualization frontend for Dendrite"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bevy = { version = "0.15", default-features = false, features = [
+bevy = { version = "0.17", default-features = false, features = [
     "bevy_asset",
     "bevy_scene",
     "bevy_winit",
@@ -22,9 +22,10 @@ bevy = { version = "0.15", default-features = false, features = [
     "webgl2",  # Use WebGL2 for better Linux compatibility (WebGPU needs --enable-unsafe-webgpu flag)
     "tonemapping_luts",
     "ktx2",
-    "zstd",
+    "zstd_rust",  # Renamed from "zstd" in Bevy 0.17
+    "https",  # Enable loading assets from https:// URLs (built-in since Bevy 0.17)
 ] }
-bevy_egui = "0.31"
+bevy_egui = "0.38"  # Compatible with Bevy 0.17
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [

@@ -10,7 +10,7 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (update_ui_layout, ui_system).chain());
+        app.add_systems(Update, (update_ui_layout, ui_system));
     }
 }
 
@@ -19,7 +19,7 @@ fn update_ui_layout(
     windows: Query<&Window>,
     mut ui_layout: ResMut<UiLayout>,
 ) {
-    if let Ok(window) = windows.get_single() {
+    if let Ok(window) = windows.single() {
         let width = window.width();
         let height = window.height();
 
@@ -46,15 +46,17 @@ fn ui_system(
     mut ui_layout: ResMut<UiLayout>,
     daemon_config: Res<DaemonConfig>,
     mut connection_dialog: ResMut<ConnectionDialog>,
-    mut reconnect_events: EventWriter<ReconnectEvent>,
+    mut reconnect_events: MessageWriter<ReconnectEvent>,
 ) {
     let is_mobile = ui_layout.is_mobile;
     let panel_width = ui_layout.panel_width();
     let ui_scale = ui_layout.ui_scale;
 
+    // Get the egui context - early return if not available
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
     // Set up style for mobile - larger text and touch targets
     if is_mobile {
-        let ctx = contexts.ctx_mut();
         let mut style = (*ctx.style()).clone();
         style.spacing.button_padding = egui::vec2(12.0, 8.0);
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -64,7 +66,7 @@ fn ui_system(
     // Mobile: Show toggle buttons at top
     if is_mobile {
         egui::TopBottomPanel::top("mobile_toolbar")
-            .show(contexts.ctx_mut(), |ui| {
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Menu toggle button
                     let menu_text = if ui_layout.show_left_panel { "☰ Menu" } else { "☰" };
@@ -108,7 +110,7 @@ fn ui_system(
         egui::SidePanel::left("devices_panel")
             .default_width(panel_width)
             .resizable(!is_mobile)
-            .show(contexts.ctx_mut(), |ui| {
+            .show(ctx, |ui| {
                 // On mobile, add a close button at the top
                 if is_mobile {
                     ui.horizontal(|ui| {
@@ -241,7 +243,7 @@ fn ui_system(
                         let response = if is_mobile {
                             ui.add_sized(
                                 [ui.available_width(), 36.0 * ui_scale],
-                                egui::SelectableLabel::new(is_selected, text)
+                                egui::Button::new(text).selected(is_selected)
                             )
                         } else {
                             ui.selectable_label(is_selected, text)
@@ -340,7 +342,7 @@ fn ui_system(
     if !is_mobile {
         egui::TopBottomPanel::bottom("info_panel")
             .max_height(100.0)
-            .show(contexts.ctx_mut(), |ui| {
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Dendrite - CogniPilot Hardware Visualization");
                     ui.separator();
@@ -358,7 +360,7 @@ fn ui_system(
                 egui::SidePanel::right("details_panel")
                     .default_width(if is_mobile { panel_width } else { 300.0 })
                     .resizable(!is_mobile)
-                    .show(contexts.ctx_mut(), |ui| {
+                    .show(ctx, |ui| {
                         // On mobile, add close button
                         if is_mobile {
                             ui.horizontal(|ui| {
@@ -604,7 +606,7 @@ fn ui_system(
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(contexts.ctx_mut(), |ui| {
+            .show(ctx, |ui| {
                 ui.set_min_width(300.0);
 
                 ui.label("Enter the daemon address (host:port):");
@@ -633,7 +635,7 @@ fn ui_system(
                     if ui.button("Connect").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                         let addr = connection_dialog.daemon_address.trim();
                         if !addr.is_empty() {
-                            reconnect_events.send(ReconnectEvent {
+                            reconnect_events.write(ReconnectEvent {
                                 daemon_address: addr.to_string(),
                             });
                             connection_dialog.show = false;

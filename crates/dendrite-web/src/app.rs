@@ -223,6 +223,7 @@ impl Default for ConnectionDialog {
 pub fn run() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.1, 0.1, 0.15))) // Dark blue-gray background
+        // Bevy 0.17+ has built-in https:// asset loading via the "https" feature
         .add_plugins(DefaultPlugins
             .set(WindowPlugin {
                 primary_window: Some(Window {
@@ -242,7 +243,7 @@ pub fn run() {
                 ..default()
             })
         )
-        .add_plugins(EguiPlugin)
+        .add_plugins(EguiPlugin::default())
         .init_resource::<DeviceRegistry>()
         .init_resource::<SelectedDevice>()
         .init_resource::<CameraSettings>()
