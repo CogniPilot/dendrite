@@ -16,6 +16,27 @@ pub struct DeviceRegistry {
     pub connected: bool,
 }
 
+/// Visual element data - a 3D model with a pose offset
+#[derive(Debug, Clone)]
+pub struct VisualData {
+    pub name: String,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    pub pose: Option<[f64; 6]>,
+    /// Model file path
+    pub model_path: Option<String>,
+    /// Model SHA for cache validation
+    pub model_sha: Option<String>,
+}
+
+/// Reference frame data - a named coordinate frame
+#[derive(Debug, Clone)]
+pub struct FrameData {
+    pub name: String,
+    pub description: Option<String>,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    pub pose: Option<[f64; 6]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceData {
     pub id: String,
@@ -26,7 +47,12 @@ pub struct DeviceData {
     pub status: DeviceStatus,
     pub version: Option<String>,
     pub position: Option<[f64; 3]>,
+    /// Legacy single model path (for backward compatibility)
     pub model_path: Option<String>,
+    /// Composite visuals with individual poses
+    pub visuals: Vec<VisualData>,
+    /// Reference frames for this device
+    pub frames: Vec<FrameData>,
     pub last_seen: Option<String>,
 }
 
@@ -99,6 +125,15 @@ pub enum ActiveRotationAxis {
 #[derive(Debug, Clone, Resource, Default)]
 pub struct ActiveRotationField {
     pub axis: ActiveRotationAxis,
+}
+
+/// Frame visibility settings for showing/hiding reference frames
+#[derive(Debug, Clone, Resource, Default)]
+pub struct FrameVisibility {
+    /// Whether to show reference frames in the 3D view
+    pub show_frames: bool,
+    /// Currently hovered frame (device_id:frame_name)
+    pub hovered_frame: Option<String>,
 }
 
 /// World visualization settings
@@ -258,6 +293,7 @@ pub fn run() {
         .init_resource::<DevicePositions>()
         .init_resource::<DeviceOrientations>()
         .init_resource::<ActiveRotationField>()
+        .init_resource::<FrameVisibility>()
         .init_resource::<WorldSettings>()
         .init_resource::<UiLayout>()
         .init_resource::<ConnectionDialog>()

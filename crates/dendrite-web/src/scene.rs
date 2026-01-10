@@ -4,10 +4,10 @@ use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::render::alpha::AlphaMode;
 use bevy::camera::primitives::MeshAabb;  // Trait for compute_aabb
-use bevy_egui::EguiContexts;
-use bevy_picking::prelude::{Click, Pointer, PointerButton};
+use bevy_egui::{egui, EguiContexts};
+use bevy_picking::prelude::{Click, Out, Over, Pointer, PointerButton};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, SelectedDevice, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, SelectedDevice, WorldSettings};
 use crate::network::HeartbeatState;
 
 pub struct ScenePlugin;
@@ -24,9 +24,13 @@ impl Plugin for ScenePlugin {
                 update_effective_rotation_axis,
                 update_world_visibility,
                 update_grid_spacing,
+                update_frame_gizmos,
+                render_frame_tooltip,
             ))
             // Use observers for picking events (Bevy 0.17 pattern)
-            .add_observer(on_device_clicked);
+            .add_observer(on_device_clicked)
+            .add_observer(on_frame_gizmo_over)
+            .add_observer(on_frame_gizmo_out);
     }
 }
 
@@ -120,6 +124,17 @@ pub struct RotationAxisIndicator {
 #[allow(dead_code)]
 pub struct EffectiveRotationAxis {
     pub target_device: String,
+}
+
+/// Marker for reference frame gizmos (coordinate frame visualization)
+#[derive(Component)]
+pub struct FrameGizmo {
+    /// Parent device ID
+    pub device_id: String,
+    /// Frame name from HCDF
+    pub frame_name: String,
+    /// Description for tooltip
+    pub description: String,
 }
 
 fn setup_scene(
@@ -1213,4 +1228,226 @@ fn update_grid_spacing(
 
     // Mark that we've regenerated the grid with current values
     world_settings.mark_grid_regenerated();
+}
+
+/// Update frame gizmos based on visibility setting and device frames
+fn update_frame_gizmos(
+    mut commands: Commands,
+    frame_visibility: Res<FrameVisibility>,
+    registry: Res<DeviceRegistry>,
+    device_query: Query<(&DeviceEntity, &Transform)>,
+    frame_gizmo_query: Query<Entity, With<FrameGizmo>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // Despawn all frame gizmos if visibility is off
+    if !frame_visibility.show_frames {
+        for entity in frame_gizmo_query.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+
+    // Check if we need to create gizmos (when visibility just turned on)
+    let gizmo_count = frame_gizmo_query.iter().count();
+
+    // Count expected gizmos
+    let expected_count: usize = registry.devices.iter()
+        .map(|d| d.frames.len())
+        .sum();
+
+    // Skip if gizmos already exist
+    if gizmo_count > 0 && gizmo_count == expected_count * 4 { // 4 entities per frame (3 axes + 1 label potential)
+        return;
+    }
+
+    // Despawn existing gizmos to recreate
+    for entity in frame_gizmo_query.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    // Frame gizmo parameters
+    let axis_length = 0.03; // 3cm axis length
+    let axis_thickness = 0.001; // 1mm thickness
+    let alpha = if frame_visibility.hovered_frame.is_some() { 0.5 } else { 0.7 };
+
+    // Create materials for RGB axes with transparency
+    let x_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.9, 0.2, 0.2, alpha),
+        emissive: bevy::color::LinearRgba::new(0.3, 0.05, 0.05, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let y_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.2, 0.9, 0.2, alpha),
+        emissive: bevy::color::LinearRgba::new(0.05, 0.3, 0.05, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let z_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.2, 0.2, 0.9, alpha),
+        emissive: bevy::color::LinearRgba::new(0.05, 0.05, 0.3, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
+    // Create cylinder meshes for axes
+    let axis_mesh = meshes.add(Cylinder::new(axis_thickness, axis_length));
+
+    // Iterate over devices and their frames
+    for device in &registry.devices {
+        // Find the device entity to get its transform
+        let device_transform = device_query.iter()
+            .find(|(d, _)| d.device_id == device.id)
+            .map(|(_, t)| t.clone());
+
+        let device_transform = match device_transform {
+            Some(t) => t,
+            None => continue, // Device not yet spawned
+        };
+
+        for frame in &device.frames {
+            // Parse frame pose
+            let frame_pose = frame.pose.unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+            let frame_translation = Vec3::new(
+                frame_pose[0] as f32,
+                frame_pose[1] as f32,
+                frame_pose[2] as f32,
+            );
+            let frame_rotation = Quat::from_euler(
+                EulerRot::ZYX,
+                frame_pose[5] as f32, // yaw
+                frame_pose[4] as f32, // pitch
+                frame_pose[3] as f32, // roll
+            );
+
+            // Compute world position: device transform * frame pose
+            let world_pos = device_transform.translation +
+                device_transform.rotation * frame_translation;
+            let world_rot = device_transform.rotation * frame_rotation;
+
+            let description = frame.description.clone().unwrap_or_default();
+
+            // X axis (red) - cylinder rotated to point along X
+            let x_axis_pos = world_pos + world_rot * Vec3::X * (axis_length / 2.0);
+            let x_rotation = world_rot * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+            commands.spawn((
+                Mesh3d(axis_mesh.clone()),
+                MeshMaterial3d(x_material.clone()),
+                Transform::from_translation(x_axis_pos).with_rotation(x_rotation),
+                FrameGizmo {
+                    device_id: device.id.clone(),
+                    frame_name: frame.name.clone(),
+                    description: description.clone(),
+                },
+            ));
+
+            // Y axis (green) - cylinder along Y (default orientation)
+            let y_axis_pos = world_pos + world_rot * Vec3::Y * (axis_length / 2.0);
+            commands.spawn((
+                Mesh3d(axis_mesh.clone()),
+                MeshMaterial3d(y_material.clone()),
+                Transform::from_translation(y_axis_pos).with_rotation(world_rot),
+                FrameGizmo {
+                    device_id: device.id.clone(),
+                    frame_name: frame.name.clone(),
+                    description: description.clone(),
+                },
+            ));
+
+            // Z axis (blue) - cylinder rotated to point along Z
+            let z_axis_pos = world_pos + world_rot * Vec3::Z * (axis_length / 2.0);
+            let z_rotation = world_rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            commands.spawn((
+                Mesh3d(axis_mesh.clone()),
+                MeshMaterial3d(z_material.clone()),
+                Transform::from_translation(z_axis_pos).with_rotation(z_rotation),
+                FrameGizmo {
+                    device_id: device.id.clone(),
+                    frame_name: frame.name.clone(),
+                    description: description.clone(),
+                },
+            ));
+        }
+    }
+}
+
+/// Observer: Handle mouse entering a frame gizmo
+fn on_frame_gizmo_over(
+    trigger: On<Pointer<Over>>,
+    frame_query: Query<&FrameGizmo>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    if let Ok(frame_gizmo) = frame_query.get(entity) {
+        // Set the hovered frame (device_id:frame_name format)
+        let frame_key = format!("{}:{}", frame_gizmo.device_id, frame_gizmo.frame_name);
+        frame_visibility.hovered_frame = Some(frame_key);
+    }
+}
+
+/// Observer: Handle mouse leaving a frame gizmo
+fn on_frame_gizmo_out(
+    trigger: On<Pointer<Out>>,
+    frame_query: Query<&FrameGizmo>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    // Only clear if this is actually a frame gizmo
+    if frame_query.get(entity).is_ok() {
+        frame_visibility.hovered_frame = None;
+    }
+}
+
+/// Render tooltip for hovered frame using egui
+fn render_frame_tooltip(
+    mut contexts: EguiContexts,
+    frame_visibility: Res<FrameVisibility>,
+    frame_query: Query<&FrameGizmo>,
+) {
+    // Only show tooltip if a frame is hovered
+    let Some(ref hovered_key) = frame_visibility.hovered_frame else {
+        return;
+    };
+
+    // Find the frame gizmo with matching key to get description
+    let mut frame_name = String::new();
+    let mut description = String::new();
+
+    for gizmo in frame_query.iter() {
+        let key = format!("{}:{}", gizmo.device_id, gizmo.frame_name);
+        if &key == hovered_key {
+            frame_name = gizmo.frame_name.clone();
+            description = gizmo.description.clone();
+            break;
+        }
+    }
+
+    if frame_name.is_empty() {
+        return;
+    }
+
+    // Get the egui context
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    // Show tooltip at cursor position
+    if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::Area::new(egui::Id::new("frame_tooltip"))
+            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(&frame_name).strong());
+                        if !description.is_empty() {
+                            ui.label(&description);
+                        }
+                    });
+            });
+    }
 }

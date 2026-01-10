@@ -65,7 +65,7 @@ cargo build --release -p dendrite-qr
 | `dendrite-daemon` | Main daemon binary with web server and discovery |
 | `dendrite-web` | Bevy-based WebGPU visualization (compiles to WASM) |
 | `dendrite-qr` | CLI tool to generate QR codes for mobile connection |
-| `dendrite-core` | Core types, device registry, fragment loading |
+| `dendrite-core` | Core types, HCDF parsing, fragment database, SHA-based caching |
 | `dendrite-mcumgr` | Async MCUmgr protocol client (wraps mcumgr-client) |
 | `dendrite-discovery` | Network discovery (ARP scanning, MCUmgr probing) |
 
@@ -202,44 +202,73 @@ ws.onmessage = (e) => {
 
 ## Device Fragments
 
-Device definitions are stored in `fragments/`. Each fragment describes a board type:
+Device definitions map board/application combinations to 3D models and reference frames. Fragments can be defined locally or fetched from [hcdf.cognipilot.org](https://hcdf.cognipilot.org).
+
+### Local Fragments (TOML)
 
 ```toml
 # fragments/index.toml
-[[fragments]]
-path = "spinali.toml"
+version = "1.0"
 
-[[fragments]]
-path = "rtk_f9p.toml"
+[[fragment]]
+board = "mr_mcxn_t1"
+app = "optical-flow"
+model = "optical_flow.glb"
+description = "PMW3901 optical flow sensor on MR-MCXN-T1"
+
+[[fragment]]
+board = "mr_mcxn_t1"
+app = "*"  # Wildcard - matches any app
+model = "mcxnt1hub.glb"
+description = "MR-MCXN-T1 development board"
 ```
 
-```toml
-# fragments/spinali.toml
-[fragment]
-name = "spinali"
-board = "spinali"
-description = "CogniPilot Spinali IMU board"
+### Remote Fragments (HCDF)
 
-[fragment.model]
-path = "spinali.glb"
-scale = 0.001
+Devices can report an HCDF URL via MCUmgr. The daemon fetches and caches these automatically:
 
-[fragment.match]
-# Match criteria for auto-identification
-board_regex = "spinali.*"
+```xml
+<?xml version="1.0"?>
+<hcdf version="1.2">
+  <comp name="optical-flow-assembly" role="sensor">
+    <description>PMW3901 optical flow sensor</description>
+
+    <!-- Multiple visuals with individual poses -->
+    <visual name="board">
+      <pose>0 0 0 0 0 0</pose>
+      <model href="models/fbf4836d-mcxnt1hub.glb" sha="fbf4836d..."/>
+    </visual>
+    <visual name="sensor">
+      <pose>0 0 -0.005 3.14159 0 0</pose>
+      <model href="models/72eef172-optical_flow.glb" sha="72eef172..."/>
+    </visual>
+
+    <!-- Reference frames (shown via "Show Reference Frames" checkbox) -->
+    <frame name="flow">
+      <description>Optical flow sensor frame</description>
+      <pose>0 0 -0.005 3.14159 0 0</pose>
+    </frame>
+  </comp>
+</hcdf>
 ```
+
+Models are cached locally with SHA-prefixed names (`{short_sha}-{name}.glb`) for deduplication.
 
 ## 3D Models
 
-Place glTF/GLB models in `assets/models/`. Models are loaded based on fragment definitions and displayed in the 3D view. The web UI supports:
+Place glTF/GLB models in `assets/models/`. Models are loaded based on fragment definitions and displayed in the 3D view.
 
-- Orbit camera (drag to rotate)
-- Pan (shift+drag or two-finger drag)
-- Zoom (scroll or pinch)
-- Device selection (click/tap on 3D models)
-- Position/rotation editing
-- Connection status indicators (green=online, red=offline, white=unknown)
-- Toggle connectivity checking via "Check connection" checkbox
+Public models are hosted at [hcdf.cognipilot.org](https://hcdf.cognipilot.org) (see [hcdf_models repository](https://github.com/CogniPilot/hcdf_models)).
+
+### Web UI Features
+
+- **Camera**: Orbit (drag), pan (right-drag), zoom (scroll/pinch)
+- **Selection**: Click devices to view details and edit position/rotation
+- **Composite visuals**: Devices can have multiple 3D models at different poses
+- **Reference frames**: Toggle "Show Reference Frames" to visualize coordinate frames
+- **Frame tooltips**: Hover over frame gizmos to see name and description
+- **Connection status**: Green=online, red=offline, white=unknown (when heartbeat disabled)
+- **Connectivity checking**: Toggle via "Check connection" checkbox
 
 ## GitHub Pages Deployment
 

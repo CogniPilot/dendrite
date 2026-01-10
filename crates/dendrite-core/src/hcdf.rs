@@ -116,6 +116,8 @@ pub struct Mcu {
     #[serde(rename = "@hwid", default)]
     pub hwid: Option<String>,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub pose_cg: Option<String>,
     #[serde(default)]
     pub mass: Option<f64>,
@@ -125,8 +127,15 @@ pub struct Mcu {
     pub software: Option<Software>,
     #[serde(default)]
     pub discovered: Option<Discovered>,
+    /// Legacy single model reference (deprecated, use visuals instead)
     #[serde(default)]
     pub model: Option<ModelRef>,
+    /// Multiple visual elements with individual poses
+    #[serde(default)]
+    pub visual: Vec<Visual>,
+    /// Reference frames for this component
+    #[serde(default)]
+    pub frame: Vec<Frame>,
     #[serde(default)]
     pub network: Option<Network>,
 }
@@ -141,6 +150,8 @@ pub struct Comp {
     #[serde(rename = "@hwid", default)]
     pub hwid: Option<String>,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub pose_cg: Option<String>,
     #[serde(default)]
     pub mass: Option<f64>,
@@ -150,8 +161,15 @@ pub struct Comp {
     pub software: Option<Software>,
     #[serde(default)]
     pub discovered: Option<Discovered>,
+    /// Legacy single model reference (deprecated, use visuals instead)
     #[serde(default)]
     pub model: Option<ModelRef>,
+    /// Multiple visual elements with individual poses
+    #[serde(default)]
+    pub visual: Vec<Visual>,
+    /// Reference frames for this component
+    #[serde(default)]
+    pub frame: Vec<Frame>,
     #[serde(default)]
     pub network: Option<Network>,
 }
@@ -161,6 +179,68 @@ pub struct Comp {
 pub struct ModelRef {
     #[serde(rename = "@href")]
     pub href: String,
+    /// SHA256 hash of the model file for cache validation
+    #[serde(rename = "@sha", default)]
+    pub sha: Option<String>,
+}
+
+/// Visual element - a 3D model with a pose offset
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Visual {
+    #[serde(rename = "@name")]
+    pub name: String,
+    /// Pose offset: "x y z roll pitch yaw" (meters, radians)
+    #[serde(default)]
+    pub pose: Option<String>,
+    /// Reference to 3D model
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+}
+
+impl Visual {
+    /// Parse the pose string into a Pose struct
+    pub fn parse_pose(&self) -> Option<Pose> {
+        self.pose.as_ref().and_then(|s| parse_pose_string(s))
+    }
+}
+
+/// Reference frame - a named coordinate frame with description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Frame {
+    #[serde(rename = "@name")]
+    pub name: String,
+    /// Human-readable description of this frame
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Pose offset: "x y z roll pitch yaw" (meters, radians)
+    #[serde(default)]
+    pub pose: Option<String>,
+}
+
+impl Frame {
+    /// Parse the pose string into a Pose struct
+    pub fn parse_pose(&self) -> Option<Pose> {
+        self.pose.as_ref().and_then(|s| parse_pose_string(s))
+    }
+}
+
+/// Parse a pose string "x y z roll pitch yaw" into a Pose struct
+pub fn parse_pose_string(s: &str) -> Option<Pose> {
+    let parts: Vec<f64> = s.split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if parts.len() == 6 {
+        Some(Pose {
+            x: parts[0],
+            y: parts[1],
+            z: parts[2],
+            roll: parts[3],
+            pitch: parts[4],
+            yaw: parts[5],
+        })
+    } else {
+        None
+    }
 }
 
 /// Wired connection details
@@ -357,6 +437,7 @@ impl Hcdf {
             let mcu = Mcu {
                 name: device.name.clone(),
                 hwid: Some(hwid),
+                description: None,
                 pose_cg: device.pose.map(|p| {
                     format!("{} {} {} {} {} {}", p[0], p[1], p[2], p[3], p[4], p[5])
                 }),
@@ -373,7 +454,9 @@ impl Hcdf {
                     port: device.discovery.switch_port,
                     last_seen: Some(device.discovery.last_seen.to_rfc3339()),
                 }),
-                model: device.model_path.as_ref().map(|p| ModelRef { href: p.clone() }),
+                model: device.model_path.as_ref().map(|p| ModelRef { href: p.clone(), sha: None }),
+                visual: Vec::new(),
+                frame: Vec::new(),
                 network: None,
             };
             self.mcu.push(mcu);
@@ -447,17 +530,66 @@ mod tests {
         hcdf.mcu.push(Mcu {
             name: "test-mcu".to_string(),
             hwid: Some("0xaabbccdd".to_string()),
+            description: None,
             pose_cg: None,
             mass: None,
             board: Some("test-board".to_string()),
             software: None,
             discovered: None,
             model: None,
+            visual: Vec::new(),
+            frame: Vec::new(),
             network: None,
         });
 
         let xml = hcdf.to_xml().unwrap();
         assert!(xml.contains("test-mcu"));
         assert!(xml.contains("0xaabbccdd"));
+    }
+
+    #[test]
+    fn test_parse_visual_and_frame() {
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="1.2">
+    <comp name="sensor-assembly" role="sensor">
+        <description>Test sensor</description>
+        <visual name="board">
+            <pose>0 0 0 0 0 0</pose>
+            <model href="models/board.glb" sha="abc123"/>
+        </visual>
+        <visual name="sensor">
+            <pose>0 0 -0.005 3.14159 0 0</pose>
+            <model href="models/sensor.glb"/>
+        </visual>
+        <frame name="sensor_frame">
+            <description>Sensor reference frame</description>
+            <pose>0 0 -0.005 3.14159 0 0</pose>
+        </frame>
+    </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml).unwrap();
+        assert_eq!(hcdf.comp.len(), 1);
+
+        let comp = &hcdf.comp[0];
+        assert_eq!(comp.name, "sensor-assembly");
+        assert_eq!(comp.description, Some("Test sensor".to_string()));
+
+        // Check visuals
+        assert_eq!(comp.visual.len(), 2);
+        assert_eq!(comp.visual[0].name, "board");
+        assert_eq!(comp.visual[1].name, "sensor");
+        assert_eq!(comp.visual[0].model.as_ref().unwrap().sha, Some("abc123".to_string()));
+        assert_eq!(comp.visual[1].model.as_ref().unwrap().sha, None);
+
+        // Check frames
+        assert_eq!(comp.frame.len(), 1);
+        assert_eq!(comp.frame[0].name, "sensor_frame");
+        assert_eq!(comp.frame[0].description, Some("Sensor reference frame".to_string()));
+
+        // Check pose parsing
+        let pose = comp.visual[1].parse_pose().unwrap();
+        assert!((pose.z - (-0.005)).abs() < 0.0001);
+        assert!((pose.roll - 3.14159).abs() < 0.0001);
     }
 }

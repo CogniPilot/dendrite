@@ -1,7 +1,7 @@
 //! Application state management
 
 use anyhow::Result;
-use dendrite_core::{Device, DeviceId, FragmentDatabase, Hcdf, Topology};
+use dendrite_core::{Device, DeviceFrame, DeviceId, DeviceVisual, FragmentDatabase, Hcdf, Topology, parse_pose_string};
 use dendrite_discovery::{DiscoveryEvent, DiscoveryScanner};
 use std::path::Path;
 use std::sync::Arc;
@@ -88,20 +88,46 @@ impl AppState {
     async fn update_device(&self, device: &Device) -> Device {
         let parent_name = self.config.parent.as_ref().map(|p| p.name.as_str());
 
-        // Apply fragment matching if device doesn't have a model path
+        // Apply fragment matching if device doesn't have visuals
         let mut device = device.clone();
-        if device.model_path.is_none() {
+        if device.visuals.is_empty() {
             if let (Some(board), Some(app)) = (&device.info.board, &device.firmware.name) {
                 let mut fragments = self.fragments.write().await;
-                if let Some(model) = fragments.get_model(board, app) {
+                if let Some(fragment) = fragments.find_fragment(board, app) {
                     info!(
                         device = %device.id,
                         board = %board,
                         app = %app,
-                        model = %model,
-                        "Matched device to model via fragment database"
+                        visuals = fragment.visuals.len(),
+                        frames = fragment.frames.len(),
+                        "Matched device to fragment"
                     );
-                    device.model_path = Some(model);
+
+                    // Convert fragment visuals to device visuals
+                    device.visuals = fragment.visuals.iter().map(|v| {
+                        DeviceVisual {
+                            name: v.name.clone(),
+                            pose: v.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+                            model_path: v.model.as_ref().map(|m| m.href.clone()),
+                            model_sha: v.model.as_ref().and_then(|m| m.sha.clone()),
+                        }
+                    }).collect();
+
+                    // Convert fragment frames to device frames
+                    device.frames = fragment.frames.iter().map(|f| {
+                        DeviceFrame {
+                            name: f.name.clone(),
+                            description: f.description.clone(),
+                            pose: f.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+                        }
+                    }).collect();
+
+                    // Also set legacy model_path for backward compatibility
+                    if device.model_path.is_none() {
+                        device.model_path = device.visuals.first()
+                            .and_then(|v| v.model_path.clone());
+                    }
+
                     // Update the device in the scanner silently (don't trigger new events)
                     self.scanner.update_device_silent(device.clone()).await;
                 }
