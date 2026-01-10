@@ -1,14 +1,16 @@
 //! Application state management
 
 use anyhow::Result;
-use dendrite_core::{Device, DeviceFrame, DeviceId, DeviceVisual, FragmentDatabase, Hcdf, Topology, parse_pose_string};
+use dendrite_core::{Comp, Device, DeviceFrame, DeviceId, DeviceVisual, FragmentDatabase, Hcdf, Topology, parse_pose_string, sha256_hex};
 use dendrite_discovery::{DiscoveryEvent, DiscoveryScanner};
+use dendrite_mcumgr::query::query_hcdf_info;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::hcdf_fetch::HcdfFetcher;
 
 /// Shared application state
 pub struct AppState {
@@ -20,6 +22,8 @@ pub struct AppState {
     pub topology: Arc<RwLock<Topology>>,
     /// Fragment database for board/app to model mapping
     pub fragments: Arc<RwLock<FragmentDatabase>>,
+    /// Remote HCDF fetcher with caching
+    pub hcdf_fetcher: Arc<HcdfFetcher>,
     /// Configuration
     pub config: Config,
     /// Event broadcast for WebSocket clients
@@ -38,6 +42,13 @@ impl AppState {
         // Load fragment database
         let fragments = load_fragments(&config.fragments.path);
 
+        // Create HCDF fetcher with cache in fragments directory
+        let cache_dir = Path::new(&config.fragments.path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("cache");
+        let hcdf_fetcher = Arc::new(HcdfFetcher::new(cache_dir)?);
+
         // Create discovery scanner
         let scanner_config = config.to_scanner_config();
         let scanner = Arc::new(DiscoveryScanner::new(scanner_config));
@@ -50,6 +61,7 @@ impl AppState {
             hcdf: Arc::new(RwLock::new(hcdf)),
             topology: Arc::new(RwLock::new(topology)),
             fragments: Arc::new(RwLock::new(fragments)),
+            hcdf_fetcher,
             config,
             events,
         });
@@ -92,43 +104,63 @@ impl AppState {
         let mut device = device.clone();
         if device.visuals.is_empty() {
             if let (Some(board), Some(app)) = (&device.info.board, &device.firmware.name) {
-                let mut fragments = self.fragments.write().await;
-                if let Some(fragment) = fragments.find_fragment(board, app) {
+                // Try to fetch remote HCDF first (MCUmgr query + remote fetch)
+                let remote_fragment = self.try_fetch_remote_hcdf(&device, board, app).await;
+
+                if let Some((visuals, frames)) = remote_fragment {
                     info!(
                         device = %device.id,
                         board = %board,
                         app = %app,
-                        visuals = fragment.visuals.len(),
-                        frames = fragment.frames.len(),
-                        "Matched device to fragment"
+                        visuals = visuals.len(),
+                        frames = frames.len(),
+                        "Applied remote HCDF fragment"
                     );
+                    device.visuals = visuals;
+                    device.frames = frames;
+                } else {
+                    // Fall back to local fragment database
+                    let mut fragments = self.fragments.write().await;
+                    if let Some(fragment) = fragments.find_fragment(board, app) {
+                        info!(
+                            device = %device.id,
+                            board = %board,
+                            app = %app,
+                            visuals = fragment.visuals.len(),
+                            frames = fragment.frames.len(),
+                            "Matched device to local fragment"
+                        );
 
-                    // Convert fragment visuals to device visuals
-                    device.visuals = fragment.visuals.iter().map(|v| {
-                        DeviceVisual {
-                            name: v.name.clone(),
-                            pose: v.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
-                            model_path: v.model.as_ref().map(|m| m.href.clone()),
-                            model_sha: v.model.as_ref().and_then(|m| m.sha.clone()),
-                        }
-                    }).collect();
+                        // Convert fragment visuals to device visuals
+                        device.visuals = fragment.visuals.iter().map(|v| {
+                            DeviceVisual {
+                                name: v.name.clone(),
+                                toggle: v.toggle.clone(),
+                                pose: v.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+                                model_path: v.model.as_ref().map(|m| m.href.clone()),
+                                model_sha: v.model.as_ref().and_then(|m| m.sha.clone()),
+                            }
+                        }).collect();
 
-                    // Convert fragment frames to device frames
-                    device.frames = fragment.frames.iter().map(|f| {
-                        DeviceFrame {
-                            name: f.name.clone(),
-                            description: f.description.clone(),
-                            pose: f.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
-                        }
-                    }).collect();
-
-                    // Also set legacy model_path for backward compatibility
-                    if device.model_path.is_none() {
-                        device.model_path = device.visuals.first()
-                            .and_then(|v| v.model_path.clone());
+                        // Convert fragment frames to device frames
+                        device.frames = fragment.frames.iter().map(|f| {
+                            DeviceFrame {
+                                name: f.name.clone(),
+                                description: f.description.clone(),
+                                pose: f.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+                            }
+                        }).collect();
                     }
+                }
 
-                    // Update the device in the scanner silently (don't trigger new events)
+                // Also set legacy model_path for backward compatibility
+                if device.model_path.is_none() {
+                    device.model_path = device.visuals.first()
+                        .and_then(|v| v.model_path.clone());
+                }
+
+                // Update the device in the scanner silently (don't trigger new events)
+                if !device.visuals.is_empty() {
                     self.scanner.update_device_silent(device.clone()).await;
                 }
             }
@@ -185,6 +217,187 @@ impl AppState {
     pub fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent> {
         self.events.subscribe()
     }
+
+    /// Try to fetch remote HCDF for a device
+    ///
+    /// 1. Query device via MCUmgr for HCDF URL + SHA
+    /// 2. If device doesn't support HCDF group, construct fallback URL from board/app
+    /// 3. Fetch HCDF (using cache if SHA matches)
+    /// 4. Parse and return visuals/frames
+    async fn try_fetch_remote_hcdf(
+        &self,
+        device: &Device,
+        board: &str,
+        app: &str,
+    ) -> Option<(Vec<DeviceVisual>, Vec<DeviceFrame>)> {
+        // Try to query HCDF info from device via MCUmgr
+        let (device_url, device_sha) = match query_hcdf_info(device.discovery.ip, device.discovery.port).await {
+            Ok(Some(info)) => {
+                info!(
+                    device = %device.id,
+                    url = ?info.url,
+                    sha = ?info.sha,
+                    "Device reported HCDF info"
+                );
+                (info.url, info.sha)
+            }
+            Ok(None) => {
+                debug!(device = %device.id, "Device doesn't support HCDF group, using fallback URL");
+                (None, None)
+            }
+            Err(e) => {
+                debug!(device = %device.id, error = %e, "Failed to query HCDF info, using fallback URL");
+                (None, None)
+            }
+        };
+
+        // Determine the base URL for resolving relative model paths
+        let hcdf_url = device_url.clone()
+            .unwrap_or_else(|| crate::hcdf_fetch::HcdfFetcher::construct_url(board, app));
+        let root_url = get_root_url(&hcdf_url);
+
+        // Fetch HCDF (from device URL or fallback)
+        let hcdf_content = match self.hcdf_fetcher.fetch_hcdf(
+            board,
+            app,
+            device_url.as_deref(),
+            device_sha.as_deref(),
+        ).await {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                debug!(device = %device.id, "No remote HCDF available");
+                return None;
+            }
+            Err(e) => {
+                warn!(device = %device.id, error = %e, "Failed to fetch remote HCDF");
+                return None;
+            }
+        };
+
+        // Compute HCDF SHA for cache linking
+        let hcdf_sha = sha256_hex(hcdf_content.as_bytes());
+
+        // Parse the HCDF content
+        let hcdf = match dendrite_core::Hcdf::from_xml(&hcdf_content) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(device = %device.id, error = %e, "Failed to parse remote HCDF");
+                return None;
+            }
+        };
+
+        // Extract visuals and frames from first comp/mcu element
+        let comp = hcdf.comp.into_iter().next()
+            .or_else(|| {
+                hcdf.mcu.into_iter().next().map(|m| Comp {
+                    name: m.name,
+                    role: None,
+                    hwid: m.hwid,
+                    description: m.description,
+                    pose_cg: m.pose_cg,
+                    mass: m.mass,
+                    board: m.board,
+                    software: m.software,
+                    discovered: m.discovered,
+                    model: m.model,
+                    visual: m.visual,
+                    frame: m.frame,
+                    network: m.network,
+                })
+            })?;
+
+        // Convert to DeviceVisual/DeviceFrame, fetching and caching models
+        let mut visuals: Vec<DeviceVisual> = Vec::new();
+        for v in comp.visual.iter() {
+            let model_path = if let Some(model_ref) = &v.model {
+                // Resolve the model URL
+                let model_url = resolve_model_url(&model_ref.href, &root_url);
+
+                // Fetch and cache the model
+                match self.hcdf_fetcher.fetch_model(
+                    &model_url,
+                    model_ref.sha.as_deref(),
+                    &hcdf_sha,
+                ).await {
+                    Ok(Some(cached_path)) => {
+                        // Return path relative to /models/ endpoint (strip "models/" prefix)
+                        let path = cached_path.strip_prefix("models/").unwrap_or(&cached_path);
+                        Some(path.to_string())
+                    }
+                    Ok(None) => {
+                        // Fallback to remote URL if caching fails
+                        warn!(
+                            device = %device.id,
+                            model = %model_ref.href,
+                            "Failed to cache model, using remote URL"
+                        );
+                        Some(model_url)
+                    }
+                    Err(e) => {
+                        warn!(
+                            device = %device.id,
+                            model = %model_ref.href,
+                            error = %e,
+                            "Error fetching model, using remote URL"
+                        );
+                        Some(resolve_model_url(&model_ref.href, &root_url))
+                    }
+                }
+            } else {
+                None
+            };
+
+            visuals.push(DeviceVisual {
+                name: v.name.clone(),
+                toggle: v.toggle.clone(),
+                pose: v.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+                model_path,
+                model_sha: v.model.as_ref().and_then(|m| m.sha.clone()),
+            });
+        }
+
+        let frames: Vec<DeviceFrame> = comp.frame.iter().map(|f| {
+            DeviceFrame {
+                name: f.name.clone(),
+                description: f.description.clone(),
+                pose: f.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            }
+        }).collect();
+
+        if visuals.is_empty() && frames.is_empty() {
+            return None;
+        }
+
+        Some((visuals, frames))
+    }
+}
+
+/// Get the root URL from an HCDF URL (domain root for absolute paths like "models/")
+fn get_root_url(hcdf_url: &str) -> String {
+    // Extract scheme + host from URL
+    // e.g., "https://hcdf.cognipilot.org/mr_mcxn_t1/optical-flow/optical-flow.hcdf"
+    //    -> "https://hcdf.cognipilot.org/"
+    if let Some(scheme_end) = hcdf_url.find("://") {
+        let after_scheme = &hcdf_url[scheme_end + 3..];
+        if let Some(path_start) = after_scheme.find('/') {
+            return format!("{}/", &hcdf_url[..scheme_end + 3 + path_start]);
+        }
+    }
+    hcdf_url.to_string()
+}
+
+/// Resolve a model path to absolute URL
+fn resolve_model_url(model_path: &str, root_url: &str) -> String {
+    // If already absolute URL, return as-is
+    if model_path.starts_with("http://") || model_path.starts_with("https://") {
+        return model_path.to_string();
+    }
+
+    // Handle relative paths - strip ./ prefix if present
+    let path = model_path.trim_start_matches("./");
+
+    // Models are at the root level of the domain (e.g., /models/...)
+    format!("{}{}", root_url, path)
 }
 
 /// Load HCDF from file or create new

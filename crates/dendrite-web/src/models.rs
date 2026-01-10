@@ -4,7 +4,7 @@ use bevy::asset::LoadState;
 use bevy::prelude::*;
 use std::collections::HashMap;
 
-use crate::app::{DeviceRegistry, DeviceStatus, VisualData};
+use crate::app::{DeviceRegistry, DeviceStatus, FrameVisibility, VisualData};
 use crate::scene::DeviceEntity;
 
 /// Component marking a visual child entity
@@ -14,6 +14,8 @@ pub struct VisualEntity {
     pub device_id: String,
     /// Visual name
     pub visual_name: String,
+    /// Toggle group name (if any)
+    pub toggle: Option<String>,
 }
 
 pub struct ModelsPlugin;
@@ -22,7 +24,8 @@ impl Plugin for ModelsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ModelCache>()
             .add_systems(Update, load_models)
-            .add_systems(Update, sync_device_entities.after(load_models));
+            .add_systems(Update, sync_device_entities.after(load_models))
+            .add_systems(Update, update_visual_visibility.after(sync_device_entities));
     }
 }
 
@@ -185,6 +188,7 @@ fn sync_device_entities(
                             VisualEntity {
                                 device_id: device.id.clone(),
                                 visual_name: visual.name.clone(),
+                                toggle: visual.toggle.clone(),
                             },
                         )).id();
                         commands.entity(parent_entity).add_child(child);
@@ -246,8 +250,15 @@ fn sync_device_entities(
 
 /// Normalize model path for asset loading
 fn normalize_model_path(path: &str) -> String {
-    // Strip leading slash or "models/" prefix if present
+    // If it's an absolute URL, return as-is (Bevy can load from HTTP)
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+
+    // Strip leading slash
     let path = path.trim_start_matches('/');
+
+    // Ensure it starts with "models/" for local paths
     if path.starts_with("models/") {
         path.to_string()
     } else {
@@ -270,5 +281,23 @@ fn visual_to_transform(visual: &VisualData) -> Transform {
         Transform::from_translation(translation).with_rotation(rotation)
     } else {
         Transform::IDENTITY
+    }
+}
+
+/// Update visibility of visual entities based on toggle state
+fn update_visual_visibility(
+    frame_visibility: Res<FrameVisibility>,
+    mut visuals: Query<(&VisualEntity, &mut Visibility)>,
+) {
+    for (visual_entity, mut visibility) in visuals.iter_mut() {
+        // Only check visuals that have a toggle group
+        if let Some(ref toggle_group) = visual_entity.toggle {
+            let should_hide = frame_visibility.is_toggle_hidden(&visual_entity.device_id, toggle_group);
+            *visibility = if should_hide {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            };
+        }
     }
 }

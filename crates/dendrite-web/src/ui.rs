@@ -336,9 +336,6 @@ fn ui_system(
                         // Axis toggle
                         ui.checkbox(&mut world_settings.show_axis, "Show World Axis");
 
-                        // Frame visualization toggle
-                        ui.checkbox(&mut frame_visibility.show_frames, "Show Reference Frames");
-
                         ui.separator();
 
                         // Grid spacing control
@@ -605,6 +602,34 @@ fn ui_system(
 
                             ui.separator();
 
+                            // Per-device frame visibility toggle (only if device has frames)
+                            if !device.frames.is_empty() {
+                                let mut show_frames = frame_visibility.show_frames_for(&id);
+                                if ui.checkbox(&mut show_frames, "Show Reference Frames").changed() {
+                                    frame_visibility.set_show_frames(&id, show_frames);
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("{} frame(s) defined", device.frames.len()))
+                                        .size(11.0 * ui_scale)
+                                        .color(egui::Color32::GRAY)
+                                );
+                                ui.separator();
+                            }
+
+                            // Per-device visual toggle checkboxes (e.g., "Hide case")
+                            let toggle_groups = FrameVisibility::get_toggle_groups(&device.visuals);
+                            if !toggle_groups.is_empty() {
+                                for toggle_group in &toggle_groups {
+                                    // Format label as "Hide {group}" with capitalized group name
+                                    let label = format!("Hide {}", capitalize_first(toggle_group));
+                                    let mut is_hidden = frame_visibility.is_toggle_hidden(&id, toggle_group);
+                                    if ui.checkbox(&mut is_hidden, &label).changed() {
+                                        frame_visibility.set_toggle_hidden(&id, toggle_group, is_hidden);
+                                    }
+                                }
+                                ui.separator();
+                            }
+
                             // Controls help - shorter on mobile
                             if !is_mobile {
                                 ui.label("Controls:");
@@ -728,5 +753,14 @@ fn format_last_seen(timestamp: &str) -> String {
         format!("{} {}", date, time)
     } else {
         timestamp.to_string()
+    }
+}
+
+/// Capitalize the first character of a string
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
     }
 }

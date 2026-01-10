@@ -6,7 +6,10 @@
 //! - Reusing unchanged models when HCDF files are updated
 //! - Efficient storage with no duplicate model files
 //!
-//! Model files are stored with SHA-prefixed names: `{short_sha}-{name}.glb`
+//! HCDF files are stored as: `{board}/{app}/{sha}-{app}.hcdf`
+//! with a symlink: `{board}/{app}/{app}.hcdf` -> `{sha}-{app}.hcdf`
+//!
+//! Model files are stored with SHA-prefixed names: `models/{short_sha}-{name}.glb`
 //! This allows multiple versions of the same logical model to coexist and
 //! enables instant cache lookups by SHA.
 
@@ -34,6 +37,12 @@ pub struct CachedHcdf {
     pub url: String,
     /// SHA256 hash of the HCDF content
     pub sha: String,
+    /// Board name (e.g., "mr_mcxn_t1")
+    #[serde(default)]
+    pub board: String,
+    /// App name (e.g., "optical-flow")
+    #[serde(default)]
+    pub app: String,
     /// Local file path (relative to cache directory)
     pub path: String,
     /// When this was fetched (ISO 8601)
@@ -67,6 +76,9 @@ pub struct CacheManifest {
     pub hcdf: HashMap<String, CachedHcdf>,
     /// Model entries keyed by their SHA (for cross-HCDF deduplication)
     pub models_by_sha: HashMap<String, String>, // SHA -> relative path
+    /// Index from board/app to latest HCDF SHA (for fallback lookups)
+    #[serde(default)]
+    pub latest_by_board_app: HashMap<String, String>, // "{board}/{app}" -> SHA
 }
 
 fn default_version() -> String {
@@ -80,6 +92,7 @@ impl CacheManifest {
             version: default_version(),
             hcdf: HashMap::new(),
             models_by_sha: HashMap::new(),
+            latest_by_board_app: HashMap::new(),
         }
     }
 
@@ -137,7 +150,24 @@ impl CacheManifest {
                 self.models_by_sha.insert(model.sha.clone(), model.path.clone());
             }
         }
+        // Update board/app index to point to this (latest) version
+        if !entry.board.is_empty() && !entry.app.is_empty() {
+            let key = format!("{}/{}", entry.board, entry.app);
+            self.latest_by_board_app.insert(key, entry.sha.clone());
+        }
         self.hcdf.insert(entry.sha.clone(), entry);
+    }
+
+    /// Get the latest cached HCDF SHA for a board/app combination
+    pub fn get_latest_sha(&self, board: &str, app: &str) -> Option<&str> {
+        let key = format!("{}/{}", board, app);
+        self.latest_by_board_app.get(&key).map(|s| s.as_str())
+    }
+
+    /// Get the latest cached HCDF entry for a board/app combination
+    pub fn get_latest_hcdf(&self, board: &str, app: &str) -> Option<&CachedHcdf> {
+        self.get_latest_sha(board, app)
+            .and_then(|sha| self.hcdf.get(sha))
     }
 
     /// Get the local path for an HCDF file by its SHA
@@ -209,19 +239,50 @@ impl FragmentCache {
     }
 
     /// Store an HCDF file in the cache
+    ///
+    /// Files are stored as: `{board}/{app}/{short_sha}-{app}.hcdf`
+    /// with a symlink: `{board}/{app}/{app}.hcdf` -> `{short_sha}-{app}.hcdf`
     pub fn store_hcdf(
         &mut self,
         url: &str,
         sha: &str,
+        board: &str,
+        app: &str,
         content: &[u8],
     ) -> Result<PathBuf, CacheError> {
-        let path = self.hcdf_path(sha);
+        let short_sha = Self::short_sha(sha);
+
+        // Create directory structure: {board}/{app}/
+        let dir = self.base_dir.join(board).join(app);
+        std::fs::create_dir_all(&dir)?;
+
+        // Store with SHA-prefixed name
+        let sha_filename = format!("{}-{}.hcdf", short_sha, app);
+        let path = dir.join(&sha_filename);
         std::fs::write(&path, content)?;
 
-        let relative_path = format!("{}.hcdf", sha);
+        // Create/update symlink for latest version
+        let symlink_name = format!("{}.hcdf", app);
+        let symlink_path = dir.join(&symlink_name);
+
+        // Remove existing symlink if present
+        if symlink_path.exists() || symlink_path.is_symlink() {
+            let _ = std::fs::remove_file(&symlink_path);
+        }
+
+        // Create symlink (relative, just the filename)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let _ = symlink(&sha_filename, &symlink_path);
+        }
+
+        let relative_path = format!("{}/{}/{}", board, app, sha_filename);
         let entry = CachedHcdf {
             url: url.to_string(),
             sha: sha.to_string(),
+            board: board.to_string(),
+            app: app.to_string(),
             path: relative_path,
             fetched_at: chrono::Utc::now().to_rfc3339(),
             models: HashMap::new(),
@@ -234,7 +295,8 @@ impl FragmentCache {
     }
 
     /// Store a model file in the cache
-    /// Files are stored as: models/{short_sha}-{name}
+    /// If model_name already has a SHA prefix (8 hex chars followed by dash), use as-is
+    /// Otherwise store as: models/{short_sha}-{name}
     pub fn store_model(
         &mut self,
         hcdf_sha: &str,
@@ -247,13 +309,24 @@ impl FragmentCache {
         let models_dir = self.models_dir();
         std::fs::create_dir_all(&models_dir)?;
 
-        // Store with SHA-prefixed name
         let short_sha = Self::short_sha(model_sha);
-        let sha_prefixed_name = format!("{}-{}", short_sha, model_name);
-        let path = models_dir.join(&sha_prefixed_name);
+
+        // Check if filename already has a SHA prefix (8 hex chars + dash)
+        let has_sha_prefix = model_name.len() > 9
+            && model_name.chars().nth(8) == Some('-')
+            && model_name[..8].chars().all(|c| c.is_ascii_hexdigit());
+
+        // Use original name if already SHA-prefixed, otherwise add SHA prefix
+        let cached_name = if has_sha_prefix {
+            model_name.to_string()
+        } else {
+            format!("{}-{}", short_sha, model_name)
+        };
+
+        let path = models_dir.join(&cached_name);
         std::fs::write(&path, content)?;
 
-        let relative_path = format!("models/{}", sha_prefixed_name);
+        let relative_path = format!("models/{}", cached_name);
 
         // Add to global model index
         self.manifest.models_by_sha.insert(model_sha.to_string(), relative_path.clone());
@@ -291,11 +364,45 @@ impl FragmentCache {
             .map(|p| self.base_dir.join(p))
     }
 
-    /// Read a cached HCDF file content
+    /// Read a cached HCDF file content by SHA
     pub fn read_hcdf(&self, sha: &str) -> Result<String, CacheError> {
         let path = self.get_cached_hcdf_path(sha)
             .ok_or_else(|| CacheError::NotCached(sha.to_string()))?;
         Ok(std::fs::read_to_string(path)?)
+    }
+
+    /// Read the latest cached HCDF for a board/app (follows symlink)
+    pub fn read_hcdf_by_board_app(&self, board: &str, app: &str) -> Result<String, CacheError> {
+        // First try the manifest index
+        if let Some(sha) = self.manifest.get_latest_sha(board, app) {
+            if let Ok(content) = self.read_hcdf(sha) {
+                return Ok(content);
+            }
+        }
+
+        // Fallback: try reading via symlink directly
+        let symlink_path = self.base_dir.join(board).join(app).join(format!("{}.hcdf", app));
+        if symlink_path.exists() {
+            return Ok(std::fs::read_to_string(symlink_path)?);
+        }
+
+        Err(CacheError::NotCached(format!("{}/{}", board, app)))
+    }
+
+    /// Check if we have any cached HCDF for a board/app
+    pub fn has_hcdf_for_board_app(&self, board: &str, app: &str) -> bool {
+        // Check manifest index
+        if self.manifest.get_latest_sha(board, app).is_some() {
+            return true;
+        }
+        // Check for symlink
+        let symlink_path = self.base_dir.join(board).join(app).join(format!("{}.hcdf", app));
+        symlink_path.exists()
+    }
+
+    /// Get the latest HCDF entry for a board/app
+    pub fn get_latest_hcdf(&self, board: &str, app: &str) -> Option<&CachedHcdf> {
+        self.manifest.get_latest_hcdf(board, app)
     }
 }
 
@@ -339,13 +446,17 @@ mod tests {
         // Store an HCDF
         let content = b"<hcdf>test</hcdf>";
         let sha = sha256_hex(content);
-        cache.store_hcdf("https://example.com/test.hcdf", &sha, content).unwrap();
+        cache.store_hcdf("https://example.com/test.hcdf", &sha, "test_board", "test_app", content).unwrap();
 
         assert!(cache.has_hcdf(&sha));
 
-        // Read it back
+        // Read it back by SHA
         let read_content = cache.read_hcdf(&sha).unwrap();
         assert_eq!(read_content, "<hcdf>test</hcdf>");
+
+        // Read it back by board/app
+        let read_content2 = cache.read_hcdf_by_board_app("test_board", "test_app").unwrap();
+        assert_eq!(read_content2, "<hcdf>test</hcdf>");
     }
 
     #[test]

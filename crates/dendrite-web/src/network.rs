@@ -388,6 +388,8 @@ pub struct FirmwareJson {
 pub struct VisualJson {
     pub name: String,
     #[serde(default)]
+    pub toggle: Option<String>,
+    #[serde(default)]
     pub pose: Option<[f64; 6]>,
     #[serde(default)]
     pub model_path: Option<String>,
@@ -423,6 +425,7 @@ impl From<DeviceJson> for DeviceData {
             model_path: json.model_path,
             visuals: json.visuals.into_iter().map(|v| VisualData {
                 name: v.name,
+                toggle: v.toggle,
                 pose: v.pose,
                 model_path: v.model_path,
                 model_sha: v.model_sha,

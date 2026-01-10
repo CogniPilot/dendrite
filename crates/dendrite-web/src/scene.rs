@@ -592,33 +592,52 @@ fn update_selection_highlight(
         }
     } else {
         // Create highlight box
-        // Compute bounding box from all child meshes
+        // Compute bounding box from all child meshes in device-local space
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
         let mut found_mesh = false;
 
-        // Recursively find all mesh children
+        // Recursively find all mesh children and compute bounds in device-local space
         fn collect_bounds(
             entity: Entity,
             children_query: &Query<&Children>,
             mesh_query: &Query<(&Mesh3d, &GlobalTransform)>,
             mesh_assets: &Assets<Mesh>,
-            parent_transform: &Transform,
+            device_world_pos: Vec3,
+            device_rotation_inv: Quat,
             min: &mut Vec3,
             max: &mut Vec3,
             found: &mut bool,
         ) {
             // Check if this entity has a mesh
-            if let Ok((mesh_handle, _global_transform)) = mesh_query.get(entity) {
+            if let Ok((mesh_handle, global_transform)) = mesh_query.get(entity) {
                 if let Some(mesh) = mesh_assets.get(&mesh_handle.0) {
                     if let Some(aabb) = mesh.compute_aabb() {
+                        // Transform AABB corners from mesh-local to device-local space
                         let center = Vec3::from(aabb.center);
                         let half = Vec3::from(aabb.half_extents);
-                        // Apply parent scale to the bounds
-                        let scaled_center = center * parent_transform.scale;
-                        let scaled_half = half * parent_transform.scale;
-                        *min = min.min(scaled_center - scaled_half);
-                        *max = max.max(scaled_center + scaled_half);
+
+                        // Get the 8 corners of the AABB in mesh-local space
+                        let corners = [
+                            center + Vec3::new(-half.x, -half.y, -half.z),
+                            center + Vec3::new( half.x, -half.y, -half.z),
+                            center + Vec3::new(-half.x,  half.y, -half.z),
+                            center + Vec3::new( half.x,  half.y, -half.z),
+                            center + Vec3::new(-half.x, -half.y,  half.z),
+                            center + Vec3::new( half.x, -half.y,  half.z),
+                            center + Vec3::new(-half.x,  half.y,  half.z),
+                            center + Vec3::new( half.x,  half.y,  half.z),
+                        ];
+
+                        // Transform corners: mesh-local -> world -> device-local
+                        for corner in corners {
+                            // Mesh-local to world
+                            let world_corner = global_transform.transform_point(corner);
+                            // World to device-local (undo device translation and rotation)
+                            let local_corner = device_rotation_inv * (world_corner - device_world_pos);
+                            *min = min.min(local_corner);
+                            *max = max.max(local_corner);
+                        }
                         *found = true;
                     }
                 }
@@ -627,12 +646,14 @@ fn update_selection_highlight(
             // Check children
             if let Ok(children) = children_query.get(entity) {
                 for child in children.iter() {
-                    collect_bounds(child, children_query, mesh_query, mesh_assets, parent_transform, min, max, found);
+                    collect_bounds(child, children_query, mesh_query, mesh_assets, device_world_pos, device_rotation_inv, min, max, found);
                 }
             }
         }
 
-        collect_bounds(entity, &children_query, &mesh_query, meshes.as_ref(), &device_transform, &mut min, &mut max, &mut found_mesh);
+        // Get inverse of device rotation for converting world -> device-local
+        let device_rotation_inv = device_transform.rotation.inverse();
+        collect_bounds(entity, &children_query, &mesh_query, meshes.as_ref(), device_pos, device_rotation_inv, &mut min, &mut max, &mut found_mesh);
 
         // Use default size if no mesh bounds found
         let (box_min, box_max) = if found_mesh {
@@ -1230,39 +1251,46 @@ fn update_grid_spacing(
     world_settings.mark_grid_regenerated();
 }
 
-/// Update frame gizmos based on visibility setting and device frames
+/// Update frame gizmos based on per-device visibility settings
 fn update_frame_gizmos(
     mut commands: Commands,
     frame_visibility: Res<FrameVisibility>,
     registry: Res<DeviceRegistry>,
-    device_query: Query<(&DeviceEntity, &Transform)>,
-    frame_gizmo_query: Query<Entity, With<FrameGizmo>>,
+    device_query: Query<(Entity, &DeviceEntity)>,
+    frame_gizmo_query: Query<(Entity, &FrameGizmo)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Despawn all frame gizmos if visibility is off
-    if !frame_visibility.show_frames {
-        for entity in frame_gizmo_query.iter() {
+    // First, despawn gizmos for devices that have visibility turned off
+    for (entity, gizmo) in frame_gizmo_query.iter() {
+        if !frame_visibility.show_frames_for(&gizmo.device_id) {
             commands.entity(entity).despawn();
         }
-        return;
     }
 
-    // Check if we need to create gizmos (when visibility just turned on)
-    let gizmo_count = frame_gizmo_query.iter().count();
-
-    // Count expected gizmos
+    // Count expected gizmos (only for devices with visibility on)
     let expected_count: usize = registry.devices.iter()
-        .map(|d| d.frames.len())
+        .filter(|d| frame_visibility.show_frames_for(&d.id))
+        .map(|d| d.frames.len() * 3) // 3 axis entities per frame
         .sum();
 
-    // Skip if gizmos already exist
-    if gizmo_count > 0 && gizmo_count == expected_count * 4 { // 4 entities per frame (3 axes + 1 label potential)
+    // Count current gizmos for visible devices
+    let current_count = frame_gizmo_query.iter()
+        .filter(|(_, g)| frame_visibility.show_frames_for(&g.device_id))
+        .count();
+
+    // Skip if gizmos already match expected count
+    if current_count == expected_count && expected_count > 0 {
         return;
     }
 
-    // Despawn existing gizmos to recreate
-    for entity in frame_gizmo_query.iter() {
+    // If no devices have frames visible, we're done
+    if expected_count == 0 {
+        return;
+    }
+
+    // Despawn all existing gizmos to recreate (simpler than tracking changes)
+    for (entity, _) in frame_gizmo_query.iter() {
         commands.entity(entity).despawn();
     }
 
@@ -1297,20 +1325,25 @@ fn update_frame_gizmos(
     // Create cylinder meshes for axes
     let axis_mesh = meshes.add(Cylinder::new(axis_thickness, axis_length));
 
-    // Iterate over devices and their frames
+    // Iterate over devices with frame visibility enabled
     for device in &registry.devices {
-        // Find the device entity to get its transform
-        let device_transform = device_query.iter()
-            .find(|(d, _)| d.device_id == device.id)
-            .map(|(_, t)| t.clone());
+        // Skip devices without frame visibility
+        if !frame_visibility.show_frames_for(&device.id) {
+            continue;
+        }
 
-        let device_transform = match device_transform {
-            Some(t) => t,
+        // Find the device entity to parent gizmos to
+        let device_entity = device_query.iter()
+            .find(|(_, d)| d.device_id == device.id)
+            .map(|(e, _)| e);
+
+        let device_entity = match device_entity {
+            Some(e) => e,
             None => continue, // Device not yet spawned
         };
 
         for frame in &device.frames {
-            // Parse frame pose
+            // Parse frame pose (local to device)
             let frame_pose = frame.pose.unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
             let frame_translation = Vec3::new(
                 frame_pose[0] as f32,
@@ -1324,53 +1357,51 @@ fn update_frame_gizmos(
                 frame_pose[3] as f32, // roll
             );
 
-            // Compute world position: device transform * frame pose
-            let world_pos = device_transform.translation +
-                device_transform.rotation * frame_translation;
-            let world_rot = device_transform.rotation * frame_rotation;
-
             let description = frame.description.clone().unwrap_or_default();
 
-            // X axis (red) - cylinder rotated to point along X
-            let x_axis_pos = world_pos + world_rot * Vec3::X * (axis_length / 2.0);
-            let x_rotation = world_rot * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
-            commands.spawn((
+            // X axis (red) - cylinder rotated to point along X, positioned in local space
+            let x_axis_local_pos = frame_translation + frame_rotation * Vec3::X * (axis_length / 2.0);
+            let x_rotation = frame_rotation * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+            let x_entity = commands.spawn((
                 Mesh3d(axis_mesh.clone()),
                 MeshMaterial3d(x_material.clone()),
-                Transform::from_translation(x_axis_pos).with_rotation(x_rotation),
+                Transform::from_translation(x_axis_local_pos).with_rotation(x_rotation),
                 FrameGizmo {
                     device_id: device.id.clone(),
                     frame_name: frame.name.clone(),
                     description: description.clone(),
                 },
-            ));
+            )).id();
+            commands.entity(device_entity).add_child(x_entity);
 
             // Y axis (green) - cylinder along Y (default orientation)
-            let y_axis_pos = world_pos + world_rot * Vec3::Y * (axis_length / 2.0);
-            commands.spawn((
+            let y_axis_local_pos = frame_translation + frame_rotation * Vec3::Y * (axis_length / 2.0);
+            let y_entity = commands.spawn((
                 Mesh3d(axis_mesh.clone()),
                 MeshMaterial3d(y_material.clone()),
-                Transform::from_translation(y_axis_pos).with_rotation(world_rot),
+                Transform::from_translation(y_axis_local_pos).with_rotation(frame_rotation),
                 FrameGizmo {
                     device_id: device.id.clone(),
                     frame_name: frame.name.clone(),
                     description: description.clone(),
                 },
-            ));
+            )).id();
+            commands.entity(device_entity).add_child(y_entity);
 
             // Z axis (blue) - cylinder rotated to point along Z
-            let z_axis_pos = world_pos + world_rot * Vec3::Z * (axis_length / 2.0);
-            let z_rotation = world_rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-            commands.spawn((
+            let z_axis_local_pos = frame_translation + frame_rotation * Vec3::Z * (axis_length / 2.0);
+            let z_rotation = frame_rotation * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            let z_entity = commands.spawn((
                 Mesh3d(axis_mesh.clone()),
                 MeshMaterial3d(z_material.clone()),
-                Transform::from_translation(z_axis_pos).with_rotation(z_rotation),
+                Transform::from_translation(z_axis_local_pos).with_rotation(z_rotation),
                 FrameGizmo {
                     device_id: device.id.clone(),
                     frame_name: frame.name.clone(),
                     description: description.clone(),
                 },
-            ));
+            )).id();
+            commands.entity(device_entity).add_child(z_entity);
         }
     }
 }

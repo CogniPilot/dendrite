@@ -4,6 +4,7 @@
 
 mod api;
 mod config;
+mod hcdf_fetch;
 mod server;
 mod state;
 mod ws;
