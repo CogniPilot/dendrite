@@ -20,6 +20,8 @@ pub struct DeviceRegistry {
 #[derive(Debug, Clone)]
 pub struct VisualData {
     pub name: String,
+    /// Toggle group name for visibility control (e.g., "case")
+    pub toggle: Option<String>,
     /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
     pub pose: Option<[f64; 6]>,
     /// Model file path
@@ -127,13 +129,57 @@ pub struct ActiveRotationField {
     pub axis: ActiveRotationAxis,
 }
 
-/// Frame visibility settings for showing/hiding reference frames
+/// Frame and visual visibility settings (per-device)
 #[derive(Debug, Clone, Resource, Default)]
 pub struct FrameVisibility {
-    /// Whether to show reference frames in the 3D view
-    pub show_frames: bool,
+    /// Per-device frame visibility (device_id -> show_frames)
+    pub device_frames: std::collections::HashMap<String, bool>,
     /// Currently hovered frame (device_id:frame_name)
     pub hovered_frame: Option<String>,
+    /// Per-device, per-toggle-group hidden state: (device_id, toggle_group) -> is_hidden
+    /// Default is visible (not hidden), so only hidden groups are tracked
+    pub hidden_toggles: std::collections::HashMap<(String, String), bool>,
+}
+
+impl FrameVisibility {
+    /// Check if frames should be shown for a specific device
+    pub fn show_frames_for(&self, device_id: &str) -> bool {
+        self.device_frames.get(device_id).copied().unwrap_or(false)
+    }
+
+    /// Set frame visibility for a specific device
+    pub fn set_show_frames(&mut self, device_id: &str, show: bool) {
+        self.device_frames.insert(device_id.to_string(), show);
+    }
+
+    /// Check if a toggle group is hidden for a specific device
+    pub fn is_toggle_hidden(&self, device_id: &str, toggle_group: &str) -> bool {
+        self.hidden_toggles
+            .get(&(device_id.to_string(), toggle_group.to_string()))
+            .copied()
+            .unwrap_or(false) // Default: visible (not hidden)
+    }
+
+    /// Set whether a toggle group is hidden for a specific device
+    pub fn set_toggle_hidden(&mut self, device_id: &str, toggle_group: &str, hidden: bool) {
+        let key = (device_id.to_string(), toggle_group.to_string());
+        if hidden {
+            self.hidden_toggles.insert(key, true);
+        } else {
+            self.hidden_toggles.remove(&key);
+        }
+    }
+
+    /// Get all unique toggle groups from a device's visuals
+    pub fn get_toggle_groups(visuals: &[VisualData]) -> Vec<String> {
+        let mut groups: Vec<String> = visuals
+            .iter()
+            .filter_map(|v| v.toggle.clone())
+            .collect();
+        groups.sort();
+        groups.dedup();
+        groups
+    }
 }
 
 /// World visualization settings

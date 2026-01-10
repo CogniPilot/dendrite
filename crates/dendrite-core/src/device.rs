@@ -126,6 +126,9 @@ pub struct DeviceInfo {
 pub struct DeviceVisual {
     /// Visual element name
     pub name: String,
+    /// Toggle group name for visibility control (e.g., "case")
+    #[serde(default)]
+    pub toggle: Option<String>,
     /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
     #[serde(default)]
     pub pose: Option<[f64; 6]>,

@@ -17,6 +17,14 @@ use crate::ws;
 
 /// Run the web server (HTTP or HTTPS depending on config)
 pub async fn run(state: Arc<AppState>, bind: &str, tls: Option<&TlsConfig>) -> Result<()> {
+    // Get the cached models directory from the HCDF fetcher
+    let cached_models_dir = state.hcdf_fetcher.models_dir().await;
+    info!(
+        static_models = %state.config.models.path,
+        cached_models = %cached_models_dir.display(),
+        "Serving models from static and cached directories"
+    );
+
     // Build router
     let app = Router::new()
         // API routes
@@ -35,8 +43,9 @@ pub async fn run(state: Arc<AppState>, bind: &str, tls: Option<&TlsConfig>) -> R
         .route("/api/heartbeat", post(api::set_heartbeat))
         // WebSocket for real-time updates
         .route("/ws", get(ws::websocket_handler))
-        // Serve models
-        .nest_service("/models", ServeDir::new(&state.config.models.path))
+        // Serve cached models (from remote HCDF fetch) - takes precedence
+        .nest_service("/models", ServeDir::new(&cached_models_dir)
+            .fallback(ServeDir::new(&state.config.models.path)))
         // Static files (WASM frontend) - must be fallback for root
         .fallback_service(ServeDir::new("web"))
         // CORS

@@ -30,3 +30,5 @@ clap = { version = "4", features = ["derive"] }
 network-interface = { workspace = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls-pemfile = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10"

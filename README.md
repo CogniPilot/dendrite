@@ -165,11 +165,8 @@ mcumgr_port = 1337             # MCUmgr UDP port
 use_lldp = true
 use_arp = true
 
-[fragments]
-path = "./fragments/index.toml"  # Device fragment definitions
-
-[models]
-path = "./assets/models"         # 3D model files (glTF/GLB)
+[cache]
+path = "./fragments/cache"       # Downloaded HCDFs and models
 
 [hcdf]
 path = "./dendrite.hcdf"         # Output HCDF file
@@ -202,30 +199,42 @@ ws.onmessage = (e) => {
 
 ## Device Fragments
 
-Device definitions map board/application combinations to 3D models and reference frames. Fragments can be defined locally or fetched from [hcdf.cognipilot.org](https://hcdf.cognipilot.org).
+Device definitions (HCDF files) map board/application combinations to 3D models and reference frames. All fragments are fetched from [hcdf.cognipilot.org](https://hcdf.cognipilot.org) and cached locally for offline use.
 
-### Local Fragments (TOML)
+### URL Pattern
 
-```toml
-# fragments/index.toml
-version = "1.0"
+The daemon constructs HCDF URLs from the device's board and app names:
 
-[[fragment]]
-board = "mr_mcxn_t1"
-app = "optical-flow"
-model = "optical_flow.glb"
-description = "PMW3901 optical flow sensor on MR-MCXN-T1"
-
-[[fragment]]
-board = "mr_mcxn_t1"
-app = "*"  # Wildcard - matches any app
-model = "mcxnt1hub.glb"
-description = "MR-MCXN-T1 development board"
+```
+https://hcdf.cognipilot.org/{board}/{app}/{app}.hcdf
 ```
 
-### Remote Fragments (HCDF)
+For example, a device with board `mr_mcxn_t1` and app `optical-flow` fetches:
+```
+https://hcdf.cognipilot.org/mr_mcxn_t1/optical-flow/optical-flow.hcdf
+```
 
-Devices can report an HCDF URL via MCUmgr. The daemon fetches and caches these automatically:
+### Caching
+
+Downloaded HCDFs and models are cached in `fragments/cache/` with SHA-prefixed names:
+
+```
+fragments/cache/
+├── manifest.json                              # Cache index
+├── mr_mcxn_t1/
+│   └── optical-flow/
+│       ├── a1b2c3d4-optical-flow.hcdf        # SHA-prefixed version
+│       └── optical-flow.hcdf                  # Symlink to latest
+└── models/
+    ├── fbf4836d-mcxnt1hub.glb
+    └── 72eef172-optical_flow.glb
+```
+
+The symlink allows offline fallback - if the server is unreachable, the daemon uses the most recently cached version.
+
+### HCDF Format
+
+HCDF (Hardware Configuration Descriptive Format) files define the visuals and reference frames for a device:
 
 ```xml
 <?xml version="1.0"?>
@@ -256,9 +265,7 @@ Models are cached locally with SHA-prefixed names (`{short_sha}-{name}.glb`) for
 
 ## 3D Models
 
-Place glTF/GLB models in `assets/models/`. Models are loaded based on fragment definitions and displayed in the 3D view.
-
-Public models are hosted at [hcdf.cognipilot.org](https://hcdf.cognipilot.org) (see [hcdf_models repository](https://github.com/CogniPilot/hcdf_models)).
+All 3D models are hosted at [hcdf.cognipilot.org](https://hcdf.cognipilot.org) and fetched automatically when referenced by HCDF files. See the [hcdf_models repository](https://github.com/CogniPilot/hcdf_models) for available models.
 
 ### Web UI Features
 

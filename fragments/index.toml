@@ -1,54 +1,13 @@
 # Dendrite Fragment Database
-# Maps board/application combinations to 3D models and metadata
 #
-# Matching priority:
-# 1. Exact board + exact app match (highest priority value wins)
-# 2. Exact board + wildcard app ("*")
-# 3. No match (device gets fallback cube)
+# This file is no longer used for local fragment definitions.
+# All HCDF fragments and models are fetched from hcdf.cognipilot.org
+# and cached locally in fragments/cache/
+#
+# The daemon constructs URLs based on board/app:
+#   https://hcdf.cognipilot.org/{board}/{app}/{app}.hcdf
+#
+# Cached files use symlinks for offline fallback:
+#   fragments/cache/{board}/{app}.hcdf -> {sha}-{app}.hcdf
 
 version = "1.0"
-
-# MR-MCXN-T1 board with optical-flow application
-[[fragment]]
-board = "mr_mcxn_t1"
-app = "optical-flow"
-model = "optical_flow.glb"
-description = "PMW3901 optical flow sensor on MR-MCXN-T1"
-mass = 0.015
-priority = 10
-
-# MR-MCXN-T1 board with RTK F9P GNSS
-[[fragment]]
-board = "mr_mcxn_t1"
-app = "rtk-gnss"
-model = "rtk_f9p.glb"
-description = "u-blox ZED-F9P RTK GNSS on MR-MCXN-T1"
-mass = 0.020
-priority = 10
-
-# MR-MCXN-T1 board - default/fallback for unknown apps
-[[fragment]]
-board = "mr_mcxn_t1"
-app = "*"
-model = "mcxnt1hub.glb"
-description = "MR-MCXN-T1 development board"
-mass = 0.025
-priority = 0
-
-# NavQ Plus (i.MX 95) - companion computer
-[[fragment]]
-board = "navq95"
-app = "*"
-model = "navq95.glb"
-description = "NavQ Plus i.MX 95 companion computer"
-mass = 0.085
-priority = 0
-
-# Spinali flight controller
-[[fragment]]
-board = "spinali"
-app = "*"
-model = "spinali.glb"
-description = "Spinali flight controller"
-mass = 0.030
-priority = 0

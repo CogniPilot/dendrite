@@ -189,6 +189,9 @@ pub struct ModelRef {
 pub struct Visual {
     #[serde(rename = "@name")]
     pub name: String,
+    /// Toggle group name for visibility control (e.g., "case")
+    #[serde(rename = "@toggle", default)]
+    pub toggle: Option<String>,
     /// Pose offset: "x y z roll pitch yaw" (meters, radians)
     #[serde(default)]
     pub pose: Option<String>,
