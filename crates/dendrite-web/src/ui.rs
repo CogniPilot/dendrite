@@ -1,7 +1,7 @@
 //! UI overlays using bevy_egui
 
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts};
+use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
 use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, SelectedDevice, UiLayout, WorldSettings};
 use crate::network::{DaemonConfig, NetworkInterfaces, ReconnectEvent, trigger_scan_on_interface};
@@ -10,7 +10,10 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (update_ui_layout, ui_system));
+        // UI layout updates run in Update
+        app.add_systems(Update, update_ui_layout)
+            // Main UI system runs in EguiPrimaryContextPass for proper input handling (bevy_egui 0.38+)
+            .add_systems(EguiPrimaryContextPass, ui_system);
     }
 }
 
