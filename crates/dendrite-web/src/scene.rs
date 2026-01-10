@@ -2,8 +2,10 @@
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
-use bevy::camera::primitives::MeshAabb;
 use bevy::render::alpha::AlphaMode;
+use bevy::camera::primitives::MeshAabb;  // Trait for compute_aabb
+use bevy_egui::EguiContexts;
+use bevy_picking::prelude::{Click, Pointer, PointerButton};
 
 use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, SelectedDevice, WorldSettings};
 
@@ -11,11 +13,9 @@ pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TouchState>()
-            .add_systems(Startup, setup_scene)
+        app.add_systems(Startup, setup_scene)
             .add_systems(Update, (
                 update_camera,
-                handle_device_interaction,
                 handle_deselection,
                 update_device_positions,
                 update_device_orientations,
@@ -23,7 +23,32 @@ impl Plugin for ScenePlugin {
                 update_effective_rotation_axis,
                 update_world_visibility,
                 update_grid_spacing,
-            ));
+            ))
+            // Use observers for picking events (Bevy 0.17 pattern)
+            .add_observer(on_device_clicked);
+    }
+}
+
+/// Observer: Handle device selection when clicked using bevy_picking
+fn on_device_clicked(
+    trigger: On<Pointer<Click>>,
+    device_query: Query<(&DeviceEntity, &GlobalTransform)>,
+    mut selected: ResMut<SelectedDevice>,
+    mut camera_settings: ResMut<CameraSettings>,
+) {
+    // Only handle left clicks
+    if trigger.button != PointerButton::Primary {
+        return;
+    }
+
+    // Get the entity that was clicked (trigger.entity is the clicked entity)
+    let target_entity = trigger.entity;
+
+    // Check if the clicked entity is a device
+    if let Ok((device, transform)) = device_query.get(target_entity) {
+        selected.0 = Some(device.device_id.clone());
+        // Center camera on selected device
+        camera_settings.target_focus = transform.translation();
     }
 }
 
@@ -292,6 +317,8 @@ fn setup_scene(
     }
 }
 
+/// Camera orbit/pan/zoom controls
+/// Uses egui's wants_pointer_input() to avoid camera movement when interacting with UI
 fn update_camera(
     mut camera_query: Query<&mut Transform, With<MainCamera>>,
     mut settings: ResMut<CameraSettings>,
@@ -300,16 +327,13 @@ fn update_camera(
     mouse_button: Res<ButtonInput<MouseButton>>,
     touch_input: Res<Touches>,
     time: Res<Time>,
-    mut contexts: bevy_egui::EguiContexts,
+    mut contexts: EguiContexts,
 ) {
-    // Check if egui wants the mouse - if so, don't process camera controls
+    // Check if egui wants the pointer - bevy_egui/picking handles this via the unified picking system
     let egui_wants_pointer = contexts.ctx_mut().map(|ctx| ctx.wants_pointer_input()).unwrap_or(false);
 
     // Collect mouse motion delta
-    let mut total_motion = Vec2::ZERO;
-    for motion in mouse_motion.read() {
-        total_motion += motion.delta;
-    }
+    let total_motion: Vec2 = mouse_motion.read().map(|m| m.delta).sum();
 
     // Orbit with left mouse drag (only when UI doesn't want pointer)
     if mouse_button.pressed(MouseButton::Left) && !egui_wants_pointer {
@@ -320,46 +344,36 @@ fn update_camera(
 
     // Pan with right mouse drag (ENU: vertical plane - right and up)
     if mouse_button.pressed(MouseButton::Right) && !egui_wants_pointer {
-        // Camera position is at angle azimuth from +X axis
-        // Camera right = perpendicular to view, rotated 90° clockwise (when viewed from above)
-        // View direction projected to ground: (cos(az), sin(az))
-        // Right = 90° CW rotation = (sin(az), -cos(az))
         let right = Vec3::new(settings.azimuth.sin(), -settings.azimuth.cos(), 0.0);
         let up = Vec3::Z;
         let pan_speed = settings.distance * 0.002;
-        // Mouse right -> pan right, Mouse up -> pan up in Z
         settings.target_focus += right * total_motion.x * pan_speed;
         settings.target_focus += up * total_motion.y * pan_speed;
     }
 
-    // Translate with middle mouse drag (ENU: ground plane X-Y)
-    // Note: Middle mouse may not work in browsers due to WASM limitations
+    // Translate with middle mouse drag (ground plane X-Y)
     if mouse_button.pressed(MouseButton::Middle) && !egui_wants_pointer {
-        // Camera's right direction projected onto ground plane
         let right = Vec3::new(-settings.azimuth.sin(), settings.azimuth.cos(), 0.0);
-        // Camera's forward direction projected onto ground plane
         let forward = Vec3::new(settings.azimuth.cos(), settings.azimuth.sin(), 0.0);
         let pan_speed = settings.distance * 0.002;
-        // Mouse right -> move view right, Mouse up -> move view forward
         settings.target_focus -= right * total_motion.x * pan_speed;
         settings.target_focus += forward * total_motion.y * pan_speed;
     }
 
-    // Zoom with scroll - smooth zoom using target_distance (reduced sensitivity)
-    // Don't zoom if UI wants the pointer (scrolling in UI panels)
+    // Zoom with scroll wheel
     if !egui_wants_pointer {
         for scroll in mouse_wheel.read() {
-            let zoom_factor = 1.0 - scroll.y * settings.zoom_speed * 0.3; // Reduced by 70%
+            let zoom_factor = 1.0 - scroll.y * settings.zoom_speed * 0.3;
             settings.target_distance = (settings.target_distance * zoom_factor).clamp(0.05, 5.0);
         }
     } else {
-        // Drain the scroll events even if we're not using them
-        for _ in mouse_wheel.read() {}
+        // Drain scroll events when UI has focus
+        mouse_wheel.read().for_each(drop);
     }
 
-    // Touch support for mobile
+    // Touch support: single finger orbit
     if touch_input.iter().count() == 1 && !egui_wants_pointer {
-        for touch in touch_input.iter() {
+        if let Some(touch) = touch_input.iter().next() {
             let delta = touch.delta();
             if delta != Vec2::ZERO {
                 settings.azimuth -= delta.x * settings.sensitivity;
@@ -374,8 +388,7 @@ fn update_camera(
         let touches: Vec<_> = touch_input.iter().collect();
         if let (Some(t1), Some(t2)) = (touches.get(0), touches.get(1)) {
             let curr_dist = t1.position().distance(t2.position());
-            let prev_dist = (t1.position() - t1.delta())
-                .distance(t2.position() - t2.delta());
+            let prev_dist = (t1.position() - t1.delta()).distance(t2.position() - t2.delta());
             let zoom_factor = prev_dist / curr_dist.max(1.0);
             settings.target_distance = (settings.target_distance * zoom_factor).clamp(0.05, 5.0);
         }
@@ -384,116 +397,18 @@ fn update_camera(
     // Smooth interpolation for zoom and target
     let dt = time.delta_secs();
     let lerp_factor = 1.0 - (-settings.smooth_factor * 60.0 * dt).exp();
-    settings.distance = settings.distance + (settings.target_distance - settings.distance) * lerp_factor;
-    settings.target = settings.target + (settings.target_focus - settings.target) * lerp_factor;
+    settings.distance += (settings.target_distance - settings.distance) * lerp_factor;
+    let target_delta = (settings.target_focus - settings.target) * lerp_factor;
+    settings.target += target_delta;
 
-    // Update camera position (ENU: Z is up)
+    // Update camera position (ENU: Z is up, spherical coordinates)
     if let Ok(mut transform) = camera_query.single_mut() {
-        // Spherical coordinates with Z-up
         let x = settings.distance * settings.azimuth.cos() * settings.elevation.cos();
         let y = settings.distance * settings.azimuth.sin() * settings.elevation.cos();
         let z = settings.distance * settings.elevation.sin();
 
         transform.translation = settings.target + Vec3::new(x, y, z);
         transform.look_at(settings.target, Vec3::Z);
-    }
-}
-
-/// Track touch state for tap detection
-#[derive(Resource, Default)]
-pub struct TouchState {
-    /// Position where touch started
-    start_position: Option<Vec2>,
-    /// Whether this touch has moved significantly (is a drag, not a tap)
-    is_dragging: bool,
-}
-
-/// Handle device selection via mouse click or touch tap
-fn handle_device_interaction(
-    mut selected: ResMut<SelectedDevice>,
-    mut camera_settings: ResMut<CameraSettings>,
-    camera_query: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
-    device_query: Query<(&DeviceEntity, &GlobalTransform)>,
-    mouse_button: Res<ButtonInput<MouseButton>>,
-    touch_input: Res<Touches>,
-    windows: Query<&Window>,
-    mut contexts: bevy_egui::EguiContexts,
-    mut touch_state: ResMut<TouchState>,
-) {
-    // Check if egui wants the pointer
-    let egui_wants_pointer = contexts.ctx_mut().map(|ctx| ctx.wants_pointer_input()).unwrap_or(false);
-    if egui_wants_pointer {
-        return;
-    }
-
-    let Ok(window) = windows.single() else { return };
-    let mut selection_pos: Option<Vec2> = None;
-
-    // Track touch state for tap detection
-    if let Some(touch) = touch_input.iter().next() {
-        if touch_input.just_pressed(touch.id()) {
-            // Touch started
-            touch_state.start_position = Some(touch.position());
-            touch_state.is_dragging = false;
-        } else if touch_state.start_position.is_some() {
-            // Check if moved significantly (more than 10 pixels = dragging, not tapping)
-            let start = touch_state.start_position.unwrap();
-            if touch.position().distance(start) > 10.0 {
-                touch_state.is_dragging = true;
-            }
-        }
-    }
-
-    // Detect touch release (tap) - select device if it wasn't a drag
-    for touch in touch_input.iter() {
-        if touch_input.just_released(touch.id()) {
-            if !touch_state.is_dragging {
-                if let Some(start_pos) = touch_state.start_position {
-                    selection_pos = Some(start_pos);
-                }
-            }
-            touch_state.start_position = None;
-            touch_state.is_dragging = false;
-        }
-    }
-
-    // Handle mouse click (desktop)
-    if mouse_button.just_pressed(MouseButton::Left) {
-        if let Some(cursor_pos) = window.cursor_position() {
-            selection_pos = Some(cursor_pos);
-        }
-    }
-
-    // Process selection if we have a position to check
-    if let Some(pos) = selection_pos {
-        let Ok((camera, camera_transform)) = camera_query.single() else { return };
-        if let Ok(ray) = camera.viewport_to_world(camera_transform, pos) {
-            let mut closest: Option<(f32, String, Vec3)> = None;
-
-            for (device, transform) in device_query.iter() {
-                let to_device = transform.translation() - ray.origin;
-                let t = to_device.dot(*ray.direction);
-                if t < 0.0 {
-                    continue;
-                }
-
-                let closest_point = ray.origin + *ray.direction * t;
-                let distance_sq = (closest_point - transform.translation()).length_squared();
-
-                // Hit radius of 0.08 meters (increased from 0.05 for easier selection)
-                if distance_sq < 0.08 * 0.08 {
-                    if closest.is_none() || t < closest.as_ref().unwrap().0 {
-                        closest = Some((t, device.device_id.clone(), transform.translation()));
-                    }
-                }
-            }
-
-            if let Some((_, id, pos)) = closest {
-                selected.0 = Some(id);
-                // Center camera on selected object
-                camera_settings.target_focus = pos;
-            }
-        }
     }
 }
 

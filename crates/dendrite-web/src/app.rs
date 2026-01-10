@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 use bevy_egui::EguiPlugin;
+use bevy_picking::DefaultPickingPlugins;
 
 use crate::models::ModelsPlugin;
 use crate::network::NetworkPlugin;
@@ -243,6 +244,10 @@ pub fn run() {
                 ..default()
             })
         )
+        // Add bevy_picking from the crate (required for bevy_egui picking feature)
+        // DefaultPickingPlugins includes MeshPickingPlugin when bevy_mesh_picking_backend feature is enabled
+        // This must be added BEFORE EguiPlugin so it can detect PickingPlugin
+        .add_plugins(DefaultPickingPlugins)
         .add_plugins(EguiPlugin::default())
         .init_resource::<DeviceRegistry>()
         .init_resource::<SelectedDevice>()

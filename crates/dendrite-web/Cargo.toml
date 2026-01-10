@@ -19,13 +19,20 @@ bevy = { version = "0.17", default-features = false, features = [
     "bevy_render",
     "bevy_text",
     "bevy_ui",
+    # NOTE: Do NOT enable bevy_picking here - we use the bevy_picking crate directly
+    # to satisfy bevy_egui's dependency check (it looks for bevy_picking::PickingPlugin, not bevy::picking)
+    "reflect_auto_register",  # Required for automatic type registration in scenes
     "webgl2",  # Use WebGL2 for better Linux compatibility (WebGPU needs --enable-unsafe-webgpu flag)
     "tonemapping_luts",
     "ktx2",
     "zstd_rust",  # Renamed from "zstd" in Bevy 0.17
     "https",  # Enable loading assets from https:// URLs (built-in since Bevy 0.17)
 ] }
-bevy_egui = "0.38"  # Compatible with Bevy 0.17
+# bevy_egui with picking enabled - requires bevy_picking as a direct dependency
+# because bevy_egui checks for bevy_picking::PickingPlugin (the crate), not bevy::picking::PickingPlugin
+bevy_egui = "0.38"
+# Must add bevy_picking directly so bevy_egui can find PickingPlugin
+bevy_picking = { version = "0.17", features = ["bevy_mesh_picking_backend"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
