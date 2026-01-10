@@ -3,7 +3,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, SelectedDevice, UiLayout, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FrameVisibility, SelectedDevice, UiLayout, WorldSettings};
 use crate::network::{DaemonConfig, HeartbeatState, NetworkInterfaces, ReconnectEvent, toggle_heartbeat, trigger_scan_on_interface};
 
 pub struct UiPlugin;
@@ -44,6 +44,7 @@ fn ui_system(
     mut orientations: ResMut<DeviceOrientations>,
     mut active_rotation_field: ResMut<ActiveRotationField>,
     mut world_settings: ResMut<WorldSettings>,
+    mut frame_visibility: ResMut<FrameVisibility>,
     mut device_query: Query<(&crate::scene::DeviceEntity, &mut Transform)>,
     mut network_interfaces: ResMut<NetworkInterfaces>,
     mut heartbeat_state: ResMut<HeartbeatState>,
@@ -334,6 +335,9 @@ fn ui_system(
 
                         // Axis toggle
                         ui.checkbox(&mut world_settings.show_axis, "Show World Axis");
+
+                        // Frame visualization toggle
+                        ui.checkbox(&mut frame_visibility.show_frames, "Show Reference Frames");
 
                         ui.separator();
 

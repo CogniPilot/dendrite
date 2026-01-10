@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use crate::app::{DeviceData, DeviceRegistry, DeviceStatus};
+use crate::app::{DeviceData, DeviceRegistry, DeviceStatus, FrameData, VisualData};
 
 pub struct NetworkPlugin;
 
@@ -353,6 +353,12 @@ pub struct DeviceJson {
     pub firmware: FirmwareJson,
     pub model_path: Option<String>,
     pub pose: Option<[f64; 6]>,
+    /// Composite visuals with individual poses
+    #[serde(default)]
+    pub visuals: Vec<VisualJson>,
+    /// Reference frames for this device
+    #[serde(default)]
+    pub frames: Vec<FrameJson>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -377,6 +383,28 @@ pub struct FirmwareJson {
     pub version: Option<String>,
 }
 
+/// Visual element JSON from the backend
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisualJson {
+    pub name: String,
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    #[serde(default)]
+    pub model_path: Option<String>,
+    #[serde(default)]
+    pub model_sha: Option<String>,
+}
+
+/// Reference frame JSON from the backend
+#[derive(Debug, Clone, Deserialize)]
+pub struct FrameJson {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+}
+
 impl From<DeviceJson> for DeviceData {
     fn from(json: DeviceJson) -> Self {
         DeviceData {
@@ -393,6 +421,17 @@ impl From<DeviceJson> for DeviceData {
             version: json.firmware.version,
             position: json.pose.map(|p| [p[0], p[1], p[2]]),
             model_path: json.model_path,
+            visuals: json.visuals.into_iter().map(|v| VisualData {
+                name: v.name,
+                pose: v.pose,
+                model_path: v.model_path,
+                model_sha: v.model_sha,
+            }).collect(),
+            frames: json.frames.into_iter().map(|f| FrameData {
+                name: f.name,
+                description: f.description,
+                pose: f.pose,
+            }).collect(),
             last_seen: json.discovery.last_seen,
         }
     }

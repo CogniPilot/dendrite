@@ -121,6 +121,35 @@ pub struct DeviceInfo {
     pub mcuboot_mode: Option<String>,
 }
 
+/// Visual element - a 3D model with a pose offset
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceVisual {
+    /// Visual element name
+    pub name: String,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    /// Path to 3D model file
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// SHA256 hash of model file for cache validation
+    #[serde(default)]
+    pub model_sha: Option<String>,
+}
+
+/// Reference frame - a named coordinate frame with description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceFrame {
+    /// Frame name
+    pub name: String,
+    /// Human-readable description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+}
+
 impl Default for DeviceInfo {
     fn default() -> Self {
         Self {
@@ -150,10 +179,16 @@ pub struct Device {
     pub firmware: FirmwareInfo,
     /// Parent device ID (for topology)
     pub parent_id: Option<DeviceId>,
-    /// Path to 3D model file (glTF/GLB)
+    /// Path to 3D model file (glTF/GLB) - legacy, prefer visuals
     pub model_path: Option<String>,
     /// Pose relative to parent (x, y, z, roll, pitch, yaw)
     pub pose: Option<[f64; 6]>,
+    /// Composite visual elements with individual poses
+    #[serde(default)]
+    pub visuals: Vec<DeviceVisual>,
+    /// Reference frames for this device
+    #[serde(default)]
+    pub frames: Vec<DeviceFrame>,
 }
 
 impl Device {
@@ -178,6 +213,8 @@ impl Device {
             parent_id: None,
             model_path: None,
             pose: None,
+            visuals: Vec::new(),
+            frames: Vec::new(),
         }
     }
 

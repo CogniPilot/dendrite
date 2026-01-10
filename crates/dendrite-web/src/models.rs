@@ -4,8 +4,17 @@ use bevy::asset::LoadState;
 use bevy::prelude::*;
 use std::collections::HashMap;
 
-use crate::app::{DeviceRegistry, DeviceStatus};
+use crate::app::{DeviceRegistry, DeviceStatus, VisualData};
 use crate::scene::DeviceEntity;
+
+/// Component marking a visual child entity
+#[derive(Component)]
+pub struct VisualEntity {
+    /// Parent device ID
+    pub device_id: String,
+    /// Visual name
+    pub visual_name: String,
+}
 
 pub struct ModelsPlugin;
 
@@ -121,10 +130,74 @@ fn sync_device_entities(
             DeviceStatus::Unknown => Color::srgb(0.5, 0.5, 0.5),
         };
 
-        // If device has a model, try to load it from the server
+        // Check if device has composite visuals
+        if !device.visuals.is_empty() {
+            // Check if all visuals are ready (loaded or failed)
+            let all_ready = device.visuals.iter().all(|v| {
+                if let Some(ref model_path) = v.model_path {
+                    let asset_path = normalize_model_path(model_path);
+                    model_cache.ready.contains_key(&asset_path) || model_cache.models.contains_key(&asset_path)
+                } else {
+                    true // No model = ready
+                }
+            });
+
+            // Start loading any visuals that aren't loading yet
+            for visual in &device.visuals {
+                if let Some(ref model_path) = visual.model_path {
+                    let asset_path = normalize_model_path(model_path);
+                    if !model_cache.loading.contains_key(&asset_path)
+                        && !model_cache.models.contains_key(&asset_path)
+                        && !model_cache.ready.contains_key(&asset_path)
+                    {
+                        tracing::info!("Starting to load visual model: {}", asset_path);
+                        let handle: Handle<Gltf> = asset_server.load(&asset_path);
+                        model_cache.loading.insert(asset_path.clone(), handle);
+                    }
+                }
+            }
+
+            // If not all ready, wait for next frame
+            if !all_ready {
+                continue;
+            }
+
+            // Spawn parent entity for the device
+            let parent_entity = commands.spawn((
+                Transform::from_translation(position),
+                Visibility::default(),
+                DeviceEntity {
+                    device_id: device.id.clone(),
+                },
+            )).id();
+
+            // Spawn child entities for each visual
+            for visual in &device.visuals {
+                let visual_transform = visual_to_transform(visual);
+
+                if let Some(ref model_path) = visual.model_path {
+                    let asset_path = normalize_model_path(model_path);
+                    if let Some(scene_handle) = model_cache.models.get(&asset_path) {
+                        tracing::info!("Spawning visual {} for device {}", visual.name, device.id);
+                        let child = commands.spawn((
+                            SceneRoot(scene_handle.clone()),
+                            visual_transform,
+                            VisualEntity {
+                                device_id: device.id.clone(),
+                                visual_name: visual.name.clone(),
+                            },
+                        )).id();
+                        commands.entity(parent_entity).add_child(child);
+                    }
+                }
+            }
+
+            continue;
+        }
+
+        // Legacy: If device has a single model_path, try to load it from the server
         if let Some(ref model_path) = device.model_path {
-            // Use relative path for asset server (without leading /)
-            let asset_path = format!("models/{}", model_path);
+            let asset_path = normalize_model_path(model_path);
 
             // Start loading if not already loading or loaded
             if !model_cache.loading.contains_key(&asset_path)
@@ -168,5 +241,34 @@ fn sync_device_entities(
                 device_id: device.id.clone(),
             },
         ));
+    }
+}
+
+/// Normalize model path for asset loading
+fn normalize_model_path(path: &str) -> String {
+    // Strip leading slash or "models/" prefix if present
+    let path = path.trim_start_matches('/');
+    if path.starts_with("models/") {
+        path.to_string()
+    } else {
+        format!("models/{}", path)
+    }
+}
+
+/// Convert visual pose to Transform
+/// Pose is [x, y, z, roll, pitch, yaw] in meters/radians
+fn visual_to_transform(visual: &VisualData) -> Transform {
+    if let Some(pose) = visual.pose {
+        let translation = Vec3::new(pose[0] as f32, pose[1] as f32, pose[2] as f32);
+        // SDF convention: roll, pitch, yaw (extrinsic XYZ = intrinsic ZYX)
+        let rotation = Quat::from_euler(
+            EulerRot::ZYX,
+            pose[5] as f32, // yaw (Z)
+            pose[4] as f32, // pitch (Y)
+            pose[3] as f32, // roll (X)
+        );
+        Transform::from_translation(translation).with_rotation(rotation)
+    } else {
+        Transform::IDENTITY
     }
 }

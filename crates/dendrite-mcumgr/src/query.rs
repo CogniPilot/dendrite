@@ -141,6 +141,29 @@ mod nmp {
     pub const OP_WRITE: u8 = 2;
 }
 
+/// CogniPilot HCDF MCUmgr group for querying device fragment information
+pub mod hcdf_group {
+    /// MCUmgr group ID for HCDF queries (CogniPilot custom group)
+    pub const GROUP_HCDF: u16 = 100;
+
+    /// Command ID for querying HCDF info (URL + SHA)
+    pub const ID_HCDF_INFO: u8 = 0;
+}
+
+/// Response from HCDF info query
+///
+/// Devices that support the HCDF group will return their fragment URL and SHA,
+/// allowing the daemon to skip network fetches if the cached version matches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HcdfInfoResponse {
+    /// URL to the HCDF fragment file (e.g., "https://hcdf.cognipilot.org/spinali/v1.2.hcdf")
+    #[serde(default)]
+    pub url: Option<String>,
+    /// SHA256 hash of the HCDF content (hex string)
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
 /// Query a device for all available information
 pub async fn query_device(ip: IpAddr, port: u16) -> Result<DeviceQueryResult, QueryError> {
     info!(ip = %ip, port = port, "Querying device");
@@ -340,6 +363,59 @@ pub async fn probe_device(ip: IpAddr, port: u16, timeout_ms: u64) -> bool {
     match UdpTransportAsync::new(&ip.to_string(), port, timeout_ms).await {
         Ok(mut transport) => transport.ping().await.unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+/// Query HCDF info from a device (URL and SHA of its fragment)
+///
+/// This queries the CogniPilot custom MCUmgr group (100) to get the device's
+/// HCDF fragment URL and content hash. If the device doesn't support this group,
+/// None is returned.
+///
+/// # Arguments
+/// * `ip` - Device IP address
+/// * `port` - MCUmgr port (usually 1337)
+///
+/// # Returns
+/// * `Ok(Some(response))` - Device returned HCDF info
+/// * `Ok(None)` - Device doesn't support HCDF group or returned empty response
+/// * `Err(e)` - Transport or parse error
+pub async fn query_hcdf_info(ip: IpAddr, port: u16) -> Result<Option<HcdfInfoResponse>, QueryError> {
+    debug!(ip = %ip, port = port, "Querying HCDF info");
+
+    let mut transport = UdpTransportAsync::new(&ip.to_string(), port, DEFAULT_TIMEOUT_MS).await?;
+
+    // Send empty request body
+    let body = serde_cbor::to_vec(&HashMap::<String, String>::new())
+        .map_err(|e| QueryError::QueryFailed(e.to_string()))?;
+
+    match transport
+        .transceive(
+            nmp::OP_READ,
+            hcdf_group::GROUP_HCDF,
+            hcdf_group::ID_HCDF_INFO,
+            &body,
+        )
+        .await
+    {
+        Ok(resp_body) => {
+            let resp: HcdfInfoResponse = serde_cbor::from_slice(&resp_body)
+                .map_err(|e| QueryError::InvalidResponse(e.to_string()))?;
+
+            // Return None if both fields are empty
+            if resp.url.is_none() && resp.sha.is_none() {
+                return Ok(None);
+            }
+
+            debug!(url = ?resp.url, sha = ?resp.sha, "Got HCDF info");
+            Ok(Some(resp))
+        }
+        Err(e) => {
+            // If the device doesn't support the group, it will return an error
+            // This is expected behavior, not a failure
+            debug!(error = %e, "HCDF group not supported");
+            Ok(None)
+        }
     }
 }
 

@@ -30,7 +30,7 @@ priority = 10
 [[fragment]]
 board = "mr_mcxn_t1"
 app = "*"
-model = "mcnt1hub.glb"
+model = "mcxnt1hub.glb"
 description = "MR-MCXN-T1 development board"
 mass = 0.025
 priority = 0

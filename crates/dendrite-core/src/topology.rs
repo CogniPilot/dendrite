@@ -273,6 +273,8 @@ mod tests {
             parent_id: None,
             model_path: None,
             pose: None,
+            visuals: Vec::new(),
+            frames: Vec::new(),
         };
 
         let mut child = Device::new(
