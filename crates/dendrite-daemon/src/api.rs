@@ -278,3 +278,33 @@ pub async fn update_subnet(
     }))
     .into_response()
 }
+
+/// Request to toggle heartbeat (connection checking)
+#[derive(Deserialize)]
+pub struct HeartbeatRequest {
+    pub enabled: bool,
+}
+
+/// Enable or disable heartbeat connection checking
+pub async fn set_heartbeat(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HeartbeatRequest>,
+) -> impl IntoResponse {
+    info!(enabled = req.enabled, "Setting heartbeat checking");
+    state.scanner.set_heartbeat_enabled(req.enabled).await;
+
+    Json(serde_json::json!({
+        "status": "updated",
+        "heartbeat_enabled": req.enabled
+    }))
+}
+
+/// Get heartbeat status
+pub async fn get_heartbeat(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let enabled = state.scanner.is_heartbeat_enabled().await;
+    Json(serde_json::json!({
+        "heartbeat_enabled": enabled
+    }))
+}

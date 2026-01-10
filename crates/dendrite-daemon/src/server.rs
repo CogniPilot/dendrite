@@ -31,6 +31,8 @@ pub async fn run(state: Arc<AppState>, bind: &str, tls: Option<&TlsConfig>) -> R
         .route("/api/config", get(api::get_config))
         .route("/api/interfaces", get(api::list_interfaces))
         .route("/api/subnet", post(api::update_subnet))
+        .route("/api/heartbeat", get(api::get_heartbeat))
+        .route("/api/heartbeat", post(api::set_heartbeat))
         // WebSocket for real-time updates
         .route("/ws", get(ws::websocket_handler))
         // Serve models
