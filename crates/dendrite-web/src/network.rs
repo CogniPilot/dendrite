@@ -108,6 +108,24 @@ pub struct NetworkInterfaces {
     pub scan_in_progress: bool,
 }
 
+/// Resource storing heartbeat (connection checking) state
+#[derive(Resource)]
+pub struct HeartbeatState {
+    /// Whether connection checking is enabled
+    pub enabled: bool,
+    /// Whether we're waiting for initial state from server
+    pub loading: bool,
+}
+
+impl Default for HeartbeatState {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Default to off (no network traffic)
+            loading: true,  // Loading initial state
+        }
+    }
+}
+
 /// Request to update subnet (used by trigger_scan_on_interface)
 #[derive(Serialize)]
 #[allow(dead_code)]
@@ -126,9 +144,11 @@ impl Plugin for NetworkPlugin {
             .init_resource::<PendingMessages>()
             .init_resource::<NetworkInterfaces>()
             .init_resource::<PendingInterfaceData>()
+            .init_resource::<HeartbeatState>()
+            .init_resource::<PendingHeartbeatData>()
             .add_message::<ReconnectEvent>()
-            .add_systems(Startup, (connect_websocket, fetch_initial_devices, fetch_network_interfaces))
-            .add_systems(Update, (process_messages, process_interface_data, handle_reconnect));
+            .add_systems(Startup, (connect_websocket, fetch_initial_devices, fetch_network_interfaces, fetch_heartbeat_state))
+            .add_systems(Update, (process_messages, process_interface_data, process_heartbeat_data, handle_reconnect));
     }
 }
 
@@ -278,6 +298,10 @@ fn refetch_interfaces(daemon_config: &DaemonConfig, pending: &PendingInterfaceDa
 #[derive(Resource, Default)]
 pub struct PendingInterfaceData(pub Arc<Mutex<Option<Vec<NetworkInterfaceInfo>>>>);
 
+/// Pending heartbeat data from async fetch
+#[derive(Resource, Default)]
+pub struct PendingHeartbeatData(pub Arc<Mutex<Option<bool>>>);
+
 /// Shared message queue between WebSocket callback and Bevy
 #[derive(Resource, Default, Clone)]
 pub struct PendingMessages(pub Arc<Mutex<Vec<WsMessage>>>);
@@ -340,6 +364,7 @@ pub struct DiscoveryJson {
     #[allow(dead_code)]
     pub port: u16,
     pub switch_port: Option<u8>,
+    pub last_seen: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,6 +393,7 @@ impl From<DeviceJson> for DeviceData {
             version: json.firmware.version,
             position: json.pose.map(|p| [p[0], p[1], p[2]]),
             model_path: json.model_path,
+            last_seen: json.discovery.last_seen,
         }
     }
 }
@@ -548,6 +574,86 @@ fn process_interface_data(
             interfaces.interfaces = fetched;
             interfaces.loading = false;
         }
+    }
+}
+
+/// Fetch initial heartbeat state from backend
+fn fetch_heartbeat_state(pending: Res<PendingHeartbeatData>, daemon_config: Res<DaemonConfig>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let pending_clone = pending.0.clone();
+        let base_url = daemon_config.http_url.clone();
+
+        spawn_local(async move {
+            let url = format!("{}/api/heartbeat", base_url);
+
+            tracing::info!("Fetching heartbeat state from: {}", url);
+
+            match gloo_net::http::Request::get(&url).send().await {
+                Ok(response) => {
+                    if let Ok(text) = response.text().await {
+                        tracing::debug!("Heartbeat response: {}", text);
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(enabled) = json.get("heartbeat_enabled").and_then(|v| v.as_bool()) {
+                                if let Ok(mut data) = pending_clone.lock() {
+                                    *data = Some(enabled);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fetch heartbeat state: {:?}", e);
+                }
+            }
+        });
+    }
+}
+
+/// Process pending heartbeat data
+fn process_heartbeat_data(
+    pending: Res<PendingHeartbeatData>,
+    mut heartbeat_state: ResMut<HeartbeatState>,
+) {
+    if let Ok(mut data) = pending.0.lock() {
+        if let Some(enabled) = data.take() {
+            heartbeat_state.enabled = enabled;
+            heartbeat_state.loading = false;
+        }
+    }
+}
+
+/// Toggle heartbeat checking (called from UI)
+pub fn toggle_heartbeat(enabled: bool, base_url: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let base_url = base_url.to_string();
+
+        spawn_local(async move {
+            let url = format!("{}/api/heartbeat", base_url);
+            let body = serde_json::json!({ "enabled": enabled });
+
+            tracing::info!("Setting heartbeat to: {}", enabled);
+
+            match gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .unwrap()
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!("Heartbeat set to: {}", enabled);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to set heartbeat: {:?}", e);
+                }
+            }
+        });
     }
 }
 

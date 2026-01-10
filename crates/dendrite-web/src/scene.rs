@@ -8,6 +8,7 @@ use bevy_egui::EguiContexts;
 use bevy_picking::prelude::{Click, Pointer, PointerButton};
 
 use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, SelectedDevice, WorldSettings};
+use crate::network::HeartbeatState;
 
 pub struct ScenePlugin;
 
@@ -30,25 +31,43 @@ impl Plugin for ScenePlugin {
 }
 
 /// Observer: Handle device selection when clicked using bevy_picking
+/// For GLTF models, the click target is a mesh child - we traverse up to find DeviceEntity
 fn on_device_clicked(
     trigger: On<Pointer<Click>>,
     device_query: Query<(&DeviceEntity, &GlobalTransform)>,
+    parent_query: Query<&ChildOf>,
     mut selected: ResMut<SelectedDevice>,
     mut camera_settings: ResMut<CameraSettings>,
 ) {
-    // Only handle left clicks
-    if trigger.button != PointerButton::Primary {
+    // Access the event to get button and target
+    let event = trigger.event();
+
+    // Only handle left/primary clicks (works for both mouse and touch)
+    if event.button != PointerButton::Primary {
         return;
     }
 
-    // Get the entity that was clicked (trigger.entity is the clicked entity)
-    let target_entity = trigger.entity;
+    // Start from the clicked entity and walk up the hierarchy
+    // The entity field on the event contains the clicked entity
+    let mut current = event.entity;
 
-    // Check if the clicked entity is a device
-    if let Ok((device, transform)) = device_query.get(target_entity) {
-        selected.0 = Some(device.device_id.clone());
-        // Center camera on selected device
-        camera_settings.target_focus = transform.translation();
+    // Try to find DeviceEntity on this entity or any ancestor
+    loop {
+        // Check if current entity is a device
+        if let Ok((device, transform)) = device_query.get(current) {
+            selected.0 = Some(device.device_id.clone());
+            // Center camera on selected device
+            camera_settings.target_focus = transform.translation();
+            return;
+        }
+
+        // Try to get parent
+        if let Ok(child_of) = parent_query.get(current) {
+            current = child_of.parent();
+        } else {
+            // No parent, stop searching
+            break;
+        }
     }
 }
 
@@ -456,6 +475,7 @@ fn update_selection_highlight(
     selected: Res<SelectedDevice>,
     active_rotation_field: Res<ActiveRotationField>,
     registry: Res<crate::app::DeviceRegistry>,
+    heartbeat_state: Res<HeartbeatState>,
     device_query: Query<(Entity, &DeviceEntity, &Transform), (Without<SelectionHighlight>, Without<RotationAxisIndicator>)>,
     mut highlight_query: Query<(Entity, &mut SelectionHighlight, &MeshMaterial3d<StandardMaterial>)>,
     axis_query: Query<(Entity, &RotationAxisIndicator, &MeshMaterial3d<StandardMaterial>)>,
@@ -466,10 +486,6 @@ fn update_selection_highlight(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Log when active rotation field changes
-    if active_rotation_field.is_changed() {
-        tracing::warn!("🎯 Active rotation field changed to: {:?}", active_rotation_field.axis);
-    }
     // Get currently selected device ID
     let selected_id = selected.0.as_ref();
 
@@ -532,19 +548,26 @@ fn update_selection_highlight(
                             highlight_transform.rotation = device_rotation;
                         }
 
-                        // Update color if status changed
-                        if highlight.is_online != device_is_online {
+                        // Update color if status changed or heartbeat state changed
+                        let should_update = highlight.is_online != device_is_online;
+                        if should_update {
                             highlight.is_online = device_is_online; // Update the stored status
-                            if let Some(material) = materials.get_mut(&material_handle.0) {
-                                if device_is_online {
-                                    // Light green with 50% transparency for online
-                                    material.base_color = Color::srgba(0.3, 0.8, 0.3, 0.5);
-                                    material.emissive = bevy::color::LinearRgba::new(0.15, 0.4, 0.15, 1.0);
-                                } else {
-                                    // Dark red with 50% transparency for offline
-                                    material.base_color = Color::srgba(0.6, 0.1, 0.1, 0.5);
-                                    material.emissive = bevy::color::LinearRgba::new(0.3, 0.05, 0.05, 1.0);
-                                }
+                        }
+                        // Always update material to reflect heartbeat state
+                        // Keep offline devices red even when heartbeat is off (they were seen offline)
+                        if let Some(material) = materials.get_mut(&material_handle.0) {
+                            if !device_is_online {
+                                // Device is offline - always show red regardless of heartbeat state
+                                material.base_color = Color::srgba(0.6, 0.1, 0.1, 0.5);
+                                material.emissive = bevy::color::LinearRgba::new(0.3, 0.05, 0.05, 1.0);
+                            } else if !heartbeat_state.enabled {
+                                // Device is online but heartbeat is off - show white (status unknown)
+                                material.base_color = Color::srgba(0.8, 0.8, 0.8, 0.5);
+                                material.emissive = bevy::color::LinearRgba::new(0.2, 0.2, 0.2, 1.0);
+                            } else {
+                                // Device is online and heartbeat is on - show green
+                                material.base_color = Color::srgba(0.3, 0.8, 0.3, 0.5);
+                                material.emissive = bevy::color::LinearRgba::new(0.15, 0.4, 0.15, 1.0);
                             }
                         }
                     }
@@ -616,13 +639,18 @@ fn update_selection_highlight(
         // Store half for axis length calculation (used later)
         let half = box_size / 2.0;
 
-        // Color based on device status - light green for online, dark red for offline
-        let (base_color, emissive) = if device_is_online {
-            // Light green with 50% transparency for online
-            (Color::srgba(0.3, 0.8, 0.3, 0.5), bevy::color::LinearRgba::new(0.15, 0.4, 0.15, 1.0))
-        } else {
-            // Dark red with 50% transparency for offline
+        // Color based on device status and heartbeat state
+        // Offline devices always show red (they were seen offline)
+        // Online devices show white when heartbeat is off (status unknown), green when on
+        let (base_color, emissive) = if !device_is_online {
+            // Device is offline - always show red regardless of heartbeat state
             (Color::srgba(0.6, 0.1, 0.1, 0.5), bevy::color::LinearRgba::new(0.3, 0.05, 0.05, 1.0))
+        } else if !heartbeat_state.enabled {
+            // Device is online but heartbeat is off - show white (status unknown)
+            (Color::srgba(0.8, 0.8, 0.8, 0.5), bevy::color::LinearRgba::new(0.2, 0.2, 0.2, 1.0))
+        } else {
+            // Device is online and heartbeat is on - show green
+            (Color::srgba(0.3, 0.8, 0.3, 0.5), bevy::color::LinearRgba::new(0.15, 0.4, 0.15, 1.0))
         };
 
         let highlight_material = materials.add(StandardMaterial {
@@ -881,11 +909,6 @@ fn update_selection_highlight(
                                 ActiveRotationAxis::None => false,
                             };
 
-                            // Debug log when we actually update materials
-                            if active_rotation_field.is_changed() {
-                                tracing::warn!("  📝 Updating material for axis {:?}, is_active: {}", axis.axis, is_active);
-                            }
-
                             // Define base colors for each axis with transparency
                             // Use moderate emissive values - not too bright
                             let (base_color, emissive, unlit) = match axis.axis {
@@ -935,11 +958,6 @@ fn update_selection_highlight(
                             material.emissive = emissive;
                             material.unlit = unlit;
                             material.alpha_mode = AlphaMode::Blend; // Ensure alpha blending is enabled
-
-                            // Debug: log actual material values when changed
-                            if active_rotation_field.is_changed() {
-                                tracing::warn!("    💡 Material updated - base_color: {:?}, alpha: {}", base_color, base_color.alpha());
-                            }
                         }
                     }
                 }

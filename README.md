@@ -115,7 +115,7 @@ The daemon will:
 2. Serve the WASM frontend at `/`
 3. Provide REST API at `/api/*`
 4. Provide WebSocket at `/ws`
-5. Periodically check device health via ARP
+5. Optionally check device connectivity via ARP (disabled by default)
 
 ### QR Code Generator
 
@@ -155,7 +155,8 @@ Create a `dendrite.toml` file in the working directory:
 ```toml
 [daemon]
 bind = "0.0.0.0:8080"
-heartbeat_interval_secs = 2    # ARP health check interval
+heartbeat_interval_secs = 2    # ARP connectivity check interval
+heartbeat_enabled = false      # Disable connectivity checking by default
 
 [discovery]
 subnet = "192.168.1.0"         # Network to scan
@@ -183,6 +184,8 @@ path = "./dendrite.hcdf"         # Output HCDF file
 | `/api/interfaces` | GET | List network interfaces |
 | `/api/subnet` | POST | Update scan subnet |
 | `/api/scan` | POST | Trigger network scan |
+| `/api/heartbeat` | GET | Get connectivity check status |
+| `/api/heartbeat` | POST | Enable/disable connectivity checking |
 
 ## WebSocket
 
@@ -233,8 +236,10 @@ Place glTF/GLB models in `assets/models/`. Models are loaded based on fragment d
 - Orbit camera (drag to rotate)
 - Pan (shift+drag or two-finger drag)
 - Zoom (scroll or pinch)
-- Device selection (click/tap)
+- Device selection (click/tap on 3D models)
 - Position/rotation editing
+- Connection status indicators (green=online, red=offline, white=unknown)
+- Toggle connectivity checking via "Check connection" checkbox
 
 ## GitHub Pages Deployment
 

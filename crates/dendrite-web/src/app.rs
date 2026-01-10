@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 use bevy_egui::EguiPlugin;
-use bevy_picking::DefaultPickingPlugins;
+use bevy_picking::{DefaultPickingPlugins, prelude::MeshPickingPlugin};
 
 use crate::models::ModelsPlugin;
 use crate::network::NetworkPlugin;
@@ -27,6 +27,7 @@ pub struct DeviceData {
     pub version: Option<String>,
     pub position: Option<[f64; 3]>,
     pub model_path: Option<String>,
+    pub last_seen: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -245,9 +246,11 @@ pub fn run() {
             })
         )
         // Add bevy_picking from the crate (required for bevy_egui picking feature)
-        // DefaultPickingPlugins includes MeshPickingPlugin when bevy_mesh_picking_backend feature is enabled
-        // This must be added BEFORE EguiPlugin so it can detect PickingPlugin
+        // DefaultPickingPlugins provides core picking (PointerInputPlugin, PickingPlugin, InteractionPlugin)
+        // MeshPickingPlugin must be added separately for 3D mesh raycasting
+        // These must be added BEFORE EguiPlugin so it can detect PickingPlugin
         .add_plugins(DefaultPickingPlugins)
+        .add_plugins(MeshPickingPlugin)
         .add_plugins(EguiPlugin::default())
         .init_resource::<DeviceRegistry>()
         .init_resource::<SelectedDevice>()

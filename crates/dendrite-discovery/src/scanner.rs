@@ -29,6 +29,8 @@ pub struct ScannerConfig {
     pub interval_secs: u64,
     /// Heartbeat interval in seconds (lightweight status check)
     pub heartbeat_interval_secs: u64,
+    /// Whether heartbeat checking is enabled (sends ARP/ping to check connectivity)
+    pub heartbeat_enabled: bool,
     /// Use LLDP for port detection
     pub use_lldp: bool,
     /// Use ARP scanning
@@ -63,6 +65,7 @@ impl Default for ScannerConfig {
             mcumgr_port: MCUMGR_PORT,
             interval_secs: 60,          // Full scan every 60 seconds
             heartbeat_interval_secs: 2, // Lightweight ARP/ping check every 2 seconds
+            heartbeat_enabled: false,   // Disabled by default (no network traffic until user enables)
             use_lldp: true,
             use_arp: true,
             parent: None,
@@ -117,6 +120,18 @@ impl DiscoveryScanner {
     /// Get current config
     pub async fn get_config(&self) -> ScannerConfig {
         self.config.read().await.clone()
+    }
+
+    /// Enable or disable heartbeat checking (ARP/ping connectivity checks)
+    pub async fn set_heartbeat_enabled(&self, enabled: bool) {
+        let mut config = self.config.write().await;
+        config.heartbeat_enabled = enabled;
+        info!(enabled = enabled, "Heartbeat checking {}", if enabled { "enabled" } else { "disabled" });
+    }
+
+    /// Check if heartbeat is enabled
+    pub async fn is_heartbeat_enabled(&self) -> bool {
+        self.config.read().await.heartbeat_enabled
     }
 
     /// Subscribe to discovery events
@@ -338,24 +353,28 @@ impl DiscoveryScanner {
     pub async fn run(&self) -> Result<()> {
         use tokio::time::interval;
 
-        let config = self.config.read().await.clone();
-
         // Do initial full scan on startup
         info!("Running initial MCUmgr discovery scan");
         if let Err(e) = self.scan_once().await {
             warn!(error = %e, "Initial discovery scan failed");
         }
 
-        // Only run heartbeat checks on a timer - full scans are manual
-        let mut heartbeat_interval = interval(Duration::from_secs(config.heartbeat_interval_secs));
+        // Use a fixed 2-second interval, but check config each time to see if heartbeat is enabled
+        let mut heartbeat_interval = interval(Duration::from_secs(2));
 
-        info!(
-            heartbeat_secs = config.heartbeat_interval_secs,
-            "Heartbeat scheduler started (MCUmgr scans are manual only)"
-        );
+        info!("Heartbeat scheduler started (MCUmgr scans are manual only)");
 
         loop {
             heartbeat_interval.tick().await;
+
+            // Check if heartbeat is enabled (config may have changed at runtime)
+            let config = self.config.read().await;
+            if !config.heartbeat_enabled {
+                // Heartbeat is disabled, skip this iteration
+                continue;
+            }
+            drop(config);
+
             debug!("Running heartbeat check");
             if let Err(e) = self.heartbeat().await {
                 warn!(error = %e, "Heartbeat check failed");

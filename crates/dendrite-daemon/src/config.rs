@@ -37,6 +37,9 @@ pub struct DaemonConfig {
     /// Heartbeat interval in seconds (lightweight status check)
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
+    /// Whether heartbeat checking is enabled (sends ARP/ping to check connectivity)
+    #[serde(default)]
+    pub heartbeat_enabled: bool,
     /// TLS configuration (optional - enables HTTPS when present)
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -48,6 +51,7 @@ impl Default for DaemonConfig {
             bind: default_bind(),
             discovery_interval_secs: default_interval(),
             heartbeat_interval_secs: default_heartbeat_interval(),
+            heartbeat_enabled: false, // Disabled by default
             tls: None,
         }
     }
@@ -71,7 +75,7 @@ fn default_interval() -> u64 {
 }
 
 fn default_heartbeat_interval() -> u64 {
-    2  // Lightweight ARP/ping check every 2 seconds
+    2  // Lightweight ARP/ping check every 2 seconds (when enabled)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +224,7 @@ impl Config {
             mcumgr_port: self.discovery.mcumgr_port,
             interval_secs: self.daemon.discovery_interval_secs,
             heartbeat_interval_secs: self.daemon.heartbeat_interval_secs,
+            heartbeat_enabled: self.daemon.heartbeat_enabled,
             use_lldp: self.discovery.use_lldp,
             use_arp: self.discovery.use_arp,
             parent: self.parent.as_ref().map(|p| ParentConfig {

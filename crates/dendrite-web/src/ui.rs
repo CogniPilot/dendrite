@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
 use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, SelectedDevice, UiLayout, WorldSettings};
-use crate::network::{DaemonConfig, NetworkInterfaces, ReconnectEvent, trigger_scan_on_interface};
+use crate::network::{DaemonConfig, HeartbeatState, NetworkInterfaces, ReconnectEvent, toggle_heartbeat, trigger_scan_on_interface};
 
 pub struct UiPlugin;
 
@@ -46,6 +46,7 @@ fn ui_system(
     mut world_settings: ResMut<WorldSettings>,
     mut device_query: Query<(&crate::scene::DeviceEntity, &mut Transform)>,
     mut network_interfaces: ResMut<NetworkInterfaces>,
+    mut heartbeat_state: ResMut<HeartbeatState>,
     mut ui_layout: ResMut<UiLayout>,
     daemon_config: Res<DaemonConfig>,
     mut connection_dialog: ResMut<ConnectionDialog>,
@@ -222,6 +223,19 @@ fn ui_system(
                                 }
                             }
                         }
+
+                        // Connection checking checkbox
+                        ui.add_space(8.0);
+                        let mut check_connection = heartbeat_state.enabled;
+                        if ui.checkbox(&mut check_connection, "Check connection").changed() {
+                            heartbeat_state.enabled = check_connection;
+                            toggle_heartbeat(check_connection, &daemon_config.http_url);
+                        }
+                        ui.label(
+                            egui::RichText::new("Sends ARP pings to check device connectivity")
+                                .size(11.0 * ui_scale)
+                                .color(egui::Color32::GRAY)
+                        );
                     });
 
                 ui.separator();
@@ -231,10 +245,18 @@ fn ui_system(
                     for device in &registry.devices {
                         let is_selected = selected.0.as_ref() == Some(&device.id);
 
-                        // Show device name in green (online) or red (offline)
+                        // Device name color depends on device status and heartbeat state
+                        // Offline devices always show red (they were seen offline)
+                        // Online devices show white when heartbeat is off (status unknown)
                         let name_color = match device.status {
-                            DeviceStatus::Online => egui::Color32::from_rgb(100, 200, 100),
-                            DeviceStatus::Offline => egui::Color32::from_rgb(200, 100, 100),
+                            DeviceStatus::Offline => egui::Color32::from_rgb(200, 100, 100), // Always red
+                            DeviceStatus::Online => {
+                                if heartbeat_state.enabled {
+                                    egui::Color32::from_rgb(100, 200, 100) // Green when checking
+                                } else {
+                                    egui::Color32::from_rgb(200, 200, 200) // White when not checking
+                                }
+                            }
                             DeviceStatus::Unknown => egui::Color32::GRAY,
                         };
 
@@ -262,6 +284,7 @@ fn ui_system(
                         }
 
                         // Show inline details on desktop only (mobile uses right panel)
+                        // Note: last_seen is shown in right panel, not here
                         if is_selected && !is_mobile {
                             ui.indent("device_details", |ui| {
                                 ui.label(format!("ID: {}", &device.id));
@@ -390,9 +413,17 @@ fn ui_system(
                                     ui.end_row();
 
                                     ui.label("Status:");
+                                    // Show "Unknown" when heartbeat checking is off (only for online devices)
+                                    // Offline devices always show "Offline" - they were seen offline
                                     let status_str = match device.status {
-                                        DeviceStatus::Online => "Online",
                                         DeviceStatus::Offline => "Offline",
+                                        DeviceStatus::Online => {
+                                            if heartbeat_state.enabled {
+                                                "Online"
+                                            } else {
+                                                "Unknown"
+                                            }
+                                        }
                                         DeviceStatus::Unknown => "Unknown",
                                     };
                                     ui.label(status_str);
@@ -419,6 +450,17 @@ fn ui_system(
                                         ui.label(version);
                                         ui.end_row();
                                     }
+
+                                    ui.label("Last Seen:");
+                                    // Show "Now" if device is online, otherwise show the timestamp
+                                    if device.status == DeviceStatus::Online {
+                                        ui.label("Now");
+                                    } else if let Some(ref last_seen) = device.last_seen {
+                                        ui.label(format_last_seen(last_seen));
+                                    } else {
+                                        ui.label("Unknown");
+                                    }
+                                    ui.end_row();
 
                                     // Editable Position (ENU)
                                     ui.label("Position (ENU):");
@@ -662,5 +704,25 @@ fn ui_system(
                 ui.label("Tip: You can also use URL parameters:");
                 ui.label("?daemon=192.168.1.100:8080");
             });
+    }
+}
+
+/// Format a timestamp string (ISO 8601) to a human-readable format
+fn format_last_seen(timestamp: &str) -> String {
+    // Try to parse the ISO 8601 timestamp and format it nicely
+    // Input format: "2026-01-10T03:50:54.127583515Z"
+    // Output format: "2026-01-10 03:50:54"
+    if let Some(t_pos) = timestamp.find('T') {
+        let date = &timestamp[..t_pos];
+        let time_part = &timestamp[t_pos + 1..];
+        // Take just HH:MM:SS (first 8 chars of time part)
+        let time = if time_part.len() >= 8 {
+            &time_part[..8]
+        } else {
+            time_part.trim_end_matches('Z')
+        };
+        format!("{} {}", date, time)
+    } else {
+        timestamp.to_string()
     }
 }
