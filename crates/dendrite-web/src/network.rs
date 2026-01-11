@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use crate::app::{DeviceData, DeviceRegistry, DeviceStatus, FrameData, VisualData};
+use crate::app::{AxisAlignData, DeviceData, DeviceRegistry, DeviceStatus, FovData, FrameData, GeometryData, PortData, SensorData, VisualData};
 
 pub struct NetworkPlugin;
 
@@ -359,6 +359,12 @@ pub struct DeviceJson {
     /// Reference frames for this device
     #[serde(default)]
     pub frames: Vec<FrameJson>,
+    /// Ports on this device
+    #[serde(default)]
+    pub ports: Vec<PortJson>,
+    /// Sensors on this device
+    #[serde(default)]
+    pub sensors: Vec<SensorJson>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,6 +413,98 @@ pub struct FrameJson {
     pub pose: Option<[f64; 6]>,
 }
 
+/// Port JSON from the backend
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortJson {
+    pub name: String,
+    pub port_type: String,
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    #[serde(default)]
+    pub geometry: Vec<GeometryJson>,
+    /// Reference to visual containing the mesh (e.g., "board")
+    #[serde(default)]
+    pub visual_name: Option<String>,
+    /// GLTF mesh node name within the visual (e.g., "port_eth0")
+    #[serde(default)]
+    pub mesh_name: Option<String>,
+}
+
+/// Axis alignment JSON from the backend
+#[derive(Debug, Clone, Deserialize)]
+pub struct AxisAlignJson {
+    pub x: String,
+    pub y: String,
+    pub z: String,
+}
+
+/// Geometry JSON from the backend (tagged enum)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GeometryJson {
+    #[serde(rename = "box")]
+    Box { size: [f64; 3] },
+    Cylinder { radius: f64, length: f64 },
+    Sphere { radius: f64 },
+    Cone { radius: f64, length: f64 },
+    Frustum { near: f64, far: f64, hfov: f64, vfov: f64 },
+    ConicalFrustum { near: f64, far: f64, fov: f64 },
+    PyramidalFrustum { near: f64, far: f64, hfov: f64, vfov: f64 },
+}
+
+/// FOV JSON from the backend
+#[derive(Debug, Clone, Deserialize)]
+pub struct FovJson {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    #[serde(default)]
+    pub geometry: Option<GeometryJson>,
+}
+
+/// Sensor JSON from the backend
+#[derive(Debug, Clone, Deserialize)]
+pub struct SensorJson {
+    pub name: String,
+    pub category: String,
+    pub sensor_type: String,
+    #[serde(default)]
+    pub driver: Option<String>,
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    #[serde(default)]
+    pub axis_align: Option<AxisAlignJson>,
+    #[serde(default)]
+    pub geometry: Option<GeometryJson>,
+    #[serde(default)]
+    pub fovs: Vec<FovJson>,
+}
+
+/// Convert GeometryJson to GeometryData
+fn convert_geometry(g: GeometryJson) -> GeometryData {
+    match g {
+        GeometryJson::Box { size } => GeometryData::Box { size },
+        GeometryJson::Cylinder { radius, length } => GeometryData::Cylinder { radius, length },
+        GeometryJson::Sphere { radius } => GeometryData::Sphere { radius },
+        GeometryJson::Cone { radius, length } => GeometryData::Cone { radius, length },
+        GeometryJson::Frustum { near, far, hfov, vfov } => GeometryData::Frustum { near, far, hfov, vfov },
+        GeometryJson::ConicalFrustum { near, far, fov } => GeometryData::ConicalFrustum { near, far, fov },
+        GeometryJson::PyramidalFrustum { near, far, hfov, vfov } => GeometryData::PyramidalFrustum { near, far, hfov, vfov },
+    }
+}
+
+/// Convert FovJson to FovData
+fn convert_fov(f: FovJson) -> FovData {
+    FovData {
+        name: f.name,
+        color: f.color,
+        pose: f.pose,
+        geometry: f.geometry.map(convert_geometry),
+    }
+}
+
 impl From<DeviceJson> for DeviceData {
     fn from(json: DeviceJson) -> Self {
         DeviceData {
@@ -434,6 +532,28 @@ impl From<DeviceJson> for DeviceData {
                 name: f.name,
                 description: f.description,
                 pose: f.pose,
+            }).collect(),
+            ports: json.ports.into_iter().map(|p| PortData {
+                name: p.name,
+                port_type: p.port_type,
+                pose: p.pose,
+                geometry: p.geometry.into_iter().map(convert_geometry).collect(),
+                visual_name: p.visual_name,
+                mesh_name: p.mesh_name,
+            }).collect(),
+            sensors: json.sensors.into_iter().map(|s| SensorData {
+                name: s.name,
+                category: s.category,
+                sensor_type: s.sensor_type,
+                driver: s.driver,
+                pose: s.pose,
+                axis_align: s.axis_align.map(|a| AxisAlignData {
+                    x: a.x,
+                    y: a.y,
+                    z: a.z,
+                }),
+                geometry: s.geometry.map(convert_geometry),
+                fovs: s.fovs.into_iter().map(convert_fov).collect(),
             }).collect(),
             last_seen: json.discovery.last_seen,
         }

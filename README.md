@@ -7,8 +7,8 @@ CogniPilot hardware discovery and 3D visualization system for T1 ethernet-connec
 Dendrite is a Rust-based daemon that:
 - Discovers devices on T1 ethernet networks via ARP scanning and MCUmgr probing
 - Queries devices using the MCUmgr protocol to get chip IDs and firmware info
-- Maintains a hardware registry with device fragments (board definitions)
-- Provides a WebGPU-powered 3D visualization of device topology
+- Fetches HCDF (Hardware Configuration Descriptive Format) files from [hcdf.cognipilot.org](https://hcdf.cognipilot.org)
+- Provides a WebGPU-powered 3D visualization of device topology with sensors, ports, and reference frames
 - Supports remote access via GitHub Pages frontend at [dendrite.cognipilot.org](https://dendrite.cognipilot.org)
 
 ## Quick Start
@@ -35,7 +35,7 @@ cargo build --release -p dendrite-qr
 +------------------------------------------------------------------+
 |  +----------------+  +----------------+  +---------------------+  |
 |  |   Discovery    |  |    MCUmgr      |  |   Device Registry   |  |
-|  |  (ARP scan)    |->|    Client      |->|   (fragments)       |  |
+|  |  (ARP scan)    |->|    Client      |->|   + HCDF fetch      |  |
 |  +----------------+  +----------------+  +---------------------+  |
 |                              |                                    |
 |  +--------------------------------------------------------+      |
@@ -51,7 +51,7 @@ cargo build --release -p dendrite-qr
 |                   Browser (WASM Frontend)                         |
 +------------------------------------------------------------------+
 |  +----------------+  +----------------+  +---------------------+  |
-|  |   Bevy +       |  |   Device       |  |   UI Panels         |  |
+|  |   Bevy 0.17 +  |  |   Device       |  |   UI Panels         |  |
 |  |   WebGPU       |->|   3D Models    |->|   (bevy_egui)       |  |
 |  |   (3D view)    |  |   (glTF)       |  |                     |  |
 |  +----------------+  +----------------+  +---------------------+  |
@@ -62,8 +62,8 @@ cargo build --release -p dendrite-qr
 
 | Crate | Description |
 |-------|-------------|
-| `dendrite-daemon` | Main daemon binary with web server and discovery |
-| `dendrite-web` | Bevy-based WebGPU visualization (compiles to WASM) |
+| `dendrite-daemon` | Main daemon binary with web server, discovery, and HCDF fetching |
+| `dendrite-web` | Bevy 0.17 WebGPU visualization (compiles to WASM) |
 | `dendrite-qr` | CLI tool to generate QR codes for mobile connection |
 | `dendrite-core` | Core types, HCDF parsing, fragment database, SHA-based caching |
 | `dendrite-mcumgr` | Async MCUmgr protocol client (wraps mcumgr-client) |
@@ -93,10 +93,8 @@ cargo build --release -p dendrite-daemon
 # Build QR code generator
 cargo build --release -p dendrite-qr
 
-# Build WASM frontend
-cargo build --release -p dendrite-web --target wasm32-unknown-unknown
-wasm-bindgen --out-dir web --target web --no-typescript \
-    target/wasm32-unknown-unknown/release/dendrite_web.wasm
+# Build WASM frontend (use the build script)
+./build-web.sh
 ```
 
 ## Running
@@ -114,8 +112,9 @@ The daemon will:
 1. Start the web server on port 8080
 2. Serve the WASM frontend at `/`
 3. Provide REST API at `/api/*`
-4. Provide WebSocket at `/ws`
-5. Optionally check device connectivity via ARP (disabled by default)
+4. Provide WebSocket at `/ws` for real-time updates
+5. Auto-fetch HCDF files and models from hcdf.cognipilot.org
+6. Optionally check device connectivity via ARP (toggle in UI)
 
 ### QR Code Generator
 
@@ -132,11 +131,6 @@ For easy mobile access, use `dendrite-qr` to display a QR code:
 #   --url-only              Show URL only, no QR code
 #   --local                 Use direct daemon URL instead of remote frontend
 ```
-
-This will:
-1. Auto-detect your local IP address
-2. Check if the daemon is running
-3. Display a QR code that opens the web UI with your daemon address
 
 ### Remote Access
 
@@ -165,11 +159,17 @@ mcumgr_port = 1337             # MCUmgr UDP port
 use_lldp = true
 use_arp = true
 
+[fragments]
+path = "./fragments/index.toml"
+
+[models]
+path = "./assets/models"
+
 [cache]
-path = "./fragments/cache"       # Downloaded HCDFs and models
+path = "./fragments/cache"     # Downloaded HCDFs and models
 
 [hcdf]
-path = "./dendrite.hcdf"         # Output HCDF file
+path = "./dendrite.hcdf"       # Output HCDF file
 ```
 
 ## REST API
@@ -197,85 +197,129 @@ ws.onmessage = (e) => {
 };
 ```
 
-## Device Fragments
+## HCDF Format
 
-Device definitions (HCDF files) map board/application combinations to 3D models and reference frames. All fragments are fetched from [hcdf.cognipilot.org](https://hcdf.cognipilot.org) and cached locally for offline use.
+HCDF (Hardware Configuration Descriptive Format) version 2.0 files define the complete hardware configuration:
 
-### URL Pattern
+```xml
+<?xml version="1.0"?>
+<hcdf version="2.0">
+  <comp name="optical-flow-assembly" role="sensor">
+    <description>Optical flow sensor assembly</description>
 
-The daemon constructs HCDF URLs from the device's board and app names:
+    <!-- Ports with mesh highlighting -->
+    <port name="ETH0" type="ethernet" visual="hub_board" mesh="ETH0">
+      <pose>0.0225 -0.0155 -0.0085 0 0 0</pose>
+      <geometry><box><size>0.006 0.004 0.003</size></box></geometry>
+    </port>
+
+    <!-- Sensors with axis alignment and FOV visualization -->
+    <sensor name="imu_hub">
+      <inertial type="accel_gyro">
+        <pose>0.016 -0.001 -0.008 0 0 0</pose>
+        <driver name="icm45686">
+          <axis-align x="X" y="Y" z="Z"/>
+        </driver>
+      </inertial>
+    </sensor>
+
+    <sensor name="optical_flow">
+      <optical type="optical_flow">
+        <pose>0 0 0.002 0 0 0</pose>
+        <driver name="paa3905"/>
+        <fov name="imager" color="#88ff88">
+          <geometry>
+            <pyramidal_frustum>
+              <near>0.08</near><far>50.0</far>
+              <hfov>0.733</hfov><vfov>0.733</vfov>
+            </pyramidal_frustum>
+          </geometry>
+        </fov>
+      </optical>
+    </sensor>
+
+    <!-- Multiple visuals with toggle groups -->
+    <visual name="hub_board">
+      <pose>0 0 -0.009 1.5708 0 1.5708</pose>
+      <model href="models/mcxnt1hub.glb" sha="fbf4836d..."/>
+    </visual>
+    <visual name="case_bottom" toggle="case">
+      <pose>0 0 -0.014 0 3.14159 -1.5708</pose>
+      <model href="models/mcxnt1hub_base.glb" sha="86d9c8c8..."/>
+    </visual>
+
+    <!-- Reference frames -->
+    <frame name="board_origin">
+      <description>Main board origin</description>
+      <pose>0 0 0 0 0 0</pose>
+    </frame>
+  </comp>
+</hcdf>
+```
+
+### HCDF Features
+
+- **Ports**: Define physical connectors with type-based highlighting (Ethernet=green, CAN=yellow, etc.)
+  - `mesh` attribute links to named meshes in glTF models for precise highlighting
+- **Sensors**: IMUs, magnetometers, barometers, optical flow, ToF sensors
+  - `axis-align` defines sensor-to-body frame transformation
+  - `fov` elements visualize sensor field of view (conical, pyramidal frustum)
+- **Visuals**: Multiple glTF models with individual poses
+  - `toggle` groups allow showing/hiding visual sets (e.g., case on/off)
+- **Frames**: Named coordinate frames for sensor mounting visualization
+
+### Remote HCDF Fetching
+
+The daemon automatically fetches HCDF files based on device board/app info:
 
 ```
 https://hcdf.cognipilot.org/{board}/{app}/{app}.hcdf
 ```
 
-For example, a device with board `mr_mcxn_t1` and app `optical-flow` fetches:
+For example, board `mr_mcxn_t1` with app `optical-flow`:
 ```
 https://hcdf.cognipilot.org/mr_mcxn_t1/optical-flow/optical-flow.hcdf
 ```
 
 ### Caching
 
-Downloaded HCDFs and models are cached in `fragments/cache/` with SHA-prefixed names:
+Downloaded HCDFs and models are cached with SHA-prefixed names for deduplication:
 
 ```
 fragments/cache/
-├── manifest.json                              # Cache index
 ├── mr_mcxn_t1/
 │   └── optical-flow/
-│       ├── a1b2c3d4-optical-flow.hcdf        # SHA-prefixed version
-│       └── optical-flow.hcdf                  # Symlink to latest
+│       ├── b05fb19d-optical-flow.hcdf    # SHA-prefixed version
+│       └── optical-flow.hcdf              # Symlink to latest
 └── models/
     ├── fbf4836d-mcxnt1hub.glb
     └── 72eef172-optical_flow.glb
 ```
 
-The symlink allows offline fallback - if the server is unreachable, the daemon uses the most recently cached version.
+## Web UI Features
 
-### HCDF Format
-
-HCDF (Hardware Configuration Descriptive Format) files define the visuals and reference frames for a device:
-
-```xml
-<?xml version="1.0"?>
-<hcdf version="1.2">
-  <comp name="optical-flow-assembly" role="sensor">
-    <description>PMW3901 optical flow sensor</description>
-
-    <!-- Multiple visuals with individual poses -->
-    <visual name="board">
-      <pose>0 0 0 0 0 0</pose>
-      <model href="models/fbf4836d-mcxnt1hub.glb" sha="fbf4836d..."/>
-    </visual>
-    <visual name="sensor">
-      <pose>0 0 -0.005 3.14159 0 0</pose>
-      <model href="models/72eef172-optical_flow.glb" sha="72eef172..."/>
-    </visual>
-
-    <!-- Reference frames (shown via "Show Reference Frames" checkbox) -->
-    <frame name="flow">
-      <description>Optical flow sensor frame</description>
-      <pose>0 0 -0.005 3.14159 0 0</pose>
-    </frame>
-  </comp>
-</hcdf>
-```
-
-Models are cached locally with SHA-prefixed names (`{short_sha}-{name}.glb`) for deduplication.
-
-## 3D Models
-
-All 3D models are hosted at [hcdf.cognipilot.org](https://hcdf.cognipilot.org) and fetched automatically when referenced by HCDF files. See the [hcdf_models repository](https://github.com/CogniPilot/hcdf_models) for available models.
-
-### Web UI Features
-
-- **Camera**: Orbit (drag), pan (right-drag), zoom (scroll/pinch)
+### 3D Visualization
+- **Camera**: Orbit (left-drag), pan (right-drag), zoom (scroll/pinch)
 - **Selection**: Click devices to view details and edit position/rotation
-- **Composite visuals**: Devices can have multiple 3D models at different poses
-- **Reference frames**: Toggle "Show Reference Frames" to visualize coordinate frames
-- **Frame tooltips**: Hover over frame gizmos to see name and description
-- **Connection status**: Green=online, red=offline, white=unknown (when heartbeat disabled)
-- **Connectivity checking**: Toggle via "Check connection" checkbox
+- **Device highlight**: Wireframe box shows selected device (green=online, red=offline, white=unknown)
+
+### Sensors
+- **Sensor axes**: Toggle per-sensor coordinate frame visualization
+- **Axis alignment**: Shows raw vs aligned axes based on HCDF `axis-align`
+- **FOV cones**: Visualize sensor field of view for cameras and ToF sensors
+- **Hover highlighting**: Sensors dim when hovering others for clarity
+
+### Ports
+- **Port highlighting**: Hover ports in the UI to highlight corresponding mesh on the 3D model
+- **Type-based colors**: Ethernet (green), CAN (yellow), SPI (magenta), I2C (cyan), UART (orange), USB (blue)
+- **Mesh linking**: Ports reference named meshes in glTF models via `mesh` attribute
+
+### UI Panels
+- **Device list**: All discovered devices with status indicators
+- **Device details**: Position, rotation, sensors, ports for selected device
+- **Visual toggles**: Show/hide visual groups (e.g., case, PCB)
+- **Reference frames**: Toggle coordinate frame gizmos per device
+- **Connection status**: Real-time online/offline status with heartbeat checking
 
 ## GitHub Pages Deployment
 
@@ -293,7 +337,7 @@ The frontend at `dendrite.cognipilot.org` can connect to any daemon via the `?da
 # Run daemon with debug logging
 RUST_LOG=debug cargo run -p dendrite-daemon
 
-# Build and run WASM locally (requires local daemon)
+# Build WASM frontend locally
 ./build-web.sh
 # Then open http://localhost:8080
 

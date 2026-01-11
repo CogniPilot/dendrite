@@ -7,7 +7,8 @@ use bevy::camera::primitives::MeshAabb;  // Trait for compute_aabb
 use bevy_egui::{egui, EguiContexts};
 use bevy_picking::prelude::{Click, Out, Over, Pointer, PointerButton};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, SelectedDevice, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, SelectedDevice, ShowRotationAxis, WorldSettings};
+use crate::models::{ExcludeFromBounds, PortEntity, SensorAxisEntity, SensorFovEntity};
 use crate::network::HeartbeatState;
 
 pub struct ScenePlugin;
@@ -26,11 +27,20 @@ impl Plugin for ScenePlugin {
                 update_grid_spacing,
                 update_frame_gizmos,
                 render_frame_tooltip,
+                render_sensor_axis_tooltip,
+                render_sensor_fov_tooltip,
+                render_port_tooltip,
             ))
             // Use observers for picking events (Bevy 0.17 pattern)
             .add_observer(on_device_clicked)
             .add_observer(on_frame_gizmo_over)
-            .add_observer(on_frame_gizmo_out);
+            .add_observer(on_frame_gizmo_out)
+            .add_observer(on_sensor_axis_over)
+            .add_observer(on_sensor_axis_out)
+            .add_observer(on_sensor_fov_over)
+            .add_observer(on_sensor_fov_out)
+            .add_observer(on_port_over)
+            .add_observer(on_port_out);
     }
 }
 
@@ -489,6 +499,7 @@ fn update_selection_highlight(
     mut commands: Commands,
     selected: Res<SelectedDevice>,
     active_rotation_field: Res<ActiveRotationField>,
+    show_rotation_axis: Res<ShowRotationAxis>,
     registry: Res<crate::app::DeviceRegistry>,
     heartbeat_state: Res<HeartbeatState>,
     device_query: Query<(Entity, &DeviceEntity, &Transform), (Without<SelectionHighlight>, Without<RotationAxisIndicator>)>,
@@ -498,6 +509,7 @@ fn update_selection_highlight(
     mut axis_transform_query: Query<&mut Transform, (With<RotationAxisIndicator>, Without<SelectionHighlight>)>,
     children_query: Query<&Children>,
     mesh_query: Query<(&Mesh3d, &GlobalTransform)>,
+    exclude_query: Query<Entity, With<ExcludeFromBounds>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -511,9 +523,9 @@ fn update_selection_highlight(
         }
     }
 
-    // Remove axis indicators for devices that are no longer selected
+    // Remove axis indicators for devices that are no longer selected OR when checkbox is unchecked
     for (entity, axis, _) in axis_query.iter() {
-        if selected_id != Some(&axis.target_device) {
+        if selected_id != Some(&axis.target_device) || !show_rotation_axis.0 {
             commands.entity(entity).despawn();
         }
     }
@@ -525,6 +537,9 @@ fn update_selection_highlight(
 
     // Check if highlight already exists
     let highlight_exists = highlight_query.iter_mut().any(|(_, h, _)| &h.target_device == selected_id);
+
+    // Check if axis indicators exist (separate from highlight)
+    let axis_exists = axis_query.iter().any(|(_, a, _)| &a.target_device == selected_id);
 
     // Get device status from registry
     let device_is_online = registry.devices.iter()
@@ -597,6 +612,9 @@ fn update_selection_highlight(
         let mut max = Vec3::splat(f32::MIN);
         let mut found_mesh = false;
 
+        // Collect entities to skip (visualization entities that shouldn't affect bounding box)
+        let skip_entities: std::collections::HashSet<Entity> = exclude_query.iter().collect();
+
         // Recursively find all mesh children and compute bounds in device-local space
         fn collect_bounds(
             entity: Entity,
@@ -608,7 +626,13 @@ fn update_selection_highlight(
             min: &mut Vec3,
             max: &mut Vec3,
             found: &mut bool,
+            skip_entities: &std::collections::HashSet<Entity>,
         ) {
+            // Skip visualization entities (sensors, ports, FOV geometry)
+            if skip_entities.contains(&entity) {
+                return;
+            }
+
             // Check if this entity has a mesh
             if let Ok((mesh_handle, global_transform)) = mesh_query.get(entity) {
                 if let Some(mesh) = mesh_assets.get(&mesh_handle.0) {
@@ -646,14 +670,14 @@ fn update_selection_highlight(
             // Check children
             if let Ok(children) = children_query.get(entity) {
                 for child in children.iter() {
-                    collect_bounds(child, children_query, mesh_query, mesh_assets, device_world_pos, device_rotation_inv, min, max, found);
+                    collect_bounds(child, children_query, mesh_query, mesh_assets, device_world_pos, device_rotation_inv, min, max, found, skip_entities);
                 }
             }
         }
 
         // Get inverse of device rotation for converting world -> device-local
         let device_rotation_inv = device_transform.rotation.inverse();
-        collect_bounds(entity, &children_query, &mesh_query, meshes.as_ref(), device_pos, device_rotation_inv, &mut min, &mut max, &mut found_mesh);
+        collect_bounds(entity, &children_query, &mesh_query, meshes.as_ref(), device_pos, device_rotation_inv, &mut min, &mut max, &mut found_mesh, &skip_entities);
 
         // Use default size if no mesh bounds found
         let (box_min, box_max) = if found_mesh {
@@ -750,10 +774,14 @@ fn update_selection_highlight(
             ));
         }
 
-        // Create rotation axis indicators (FLU: Forward=X/Red, Left=Y/Green, Up=Z/Blue)
-        // Using Cuboid for axis shafts (axis-aligned, no rotation issues)
-        // Axes START at the device center and extend outward (not through center)
-        let axis_length = half.max_element() * 1.5; // Full length from center outward
+    }
+
+    // Create rotation axis indicators only if checkbox is checked AND they don't exist yet
+    // This block runs independently of highlight creation so toggling the checkbox works
+    if show_rotation_axis.0 && !axis_exists {
+        // (FLU: Forward=X/Red, Left=Y/Green, Up=Z/Blue)
+        // Use a default axis length (can be adjusted based on typical device sizes)
+        let axis_length = 0.06; // 6cm default axis length
         let axis_thickness = 0.002;
         let cone_height = axis_thickness * 3.0;
         let cone_radius = axis_thickness * 2.0;
@@ -764,12 +792,9 @@ fn update_selection_highlight(
         let body_z = device_transform.rotation * Vec3::Z;
 
         // All axis shafts use device_transform.rotation directly
-        // This works because each cuboid is defined in local body frame coordinates
-        // and device_transform.rotation transforms from body frame to world frame
         let shaft_rotation = device_transform.rotation;
 
-        // X axis (Roll/Forward - Red) - starts at center, extends along +X in body frame (FLU)
-        // Make X axis 3x longer for debugging visibility
+        // X axis (Roll/Forward - Red)
         let x_axis_material = materials.add(StandardMaterial {
             base_color: Color::srgb(0.5, 0.1, 0.1),
             emissive: bevy::color::LinearRgba::new(0.5, 0.1, 0.1, 1.0),
@@ -777,14 +802,8 @@ fn update_selection_highlight(
             alpha_mode: AlphaMode::Blend,
             ..default()
         });
-        // Cuboid elongated along LOCAL X, rotated by device rotation to align with body X
-        // Position: The cuboid's center needs to be at device_pos + body_x * (length/2)
-        // But we must account for how the rotation affects the cuboid's center
-        // Since the cuboid is centered at origin in local space, after rotation its center stays at origin
-        // So we just translate to where we want the center to be
         let x_shaft_center = device_pos + body_x * (axis_length / 2.0);
         commands.spawn((
-            // Mesh3d(meshes.add(Cuboid::new(axis_thickness, aaxis_length, axis_thickness))),
             Mesh3d(meshes.add(Cylinder::new(axis_thickness, axis_length))),
             MeshMaterial3d(x_axis_material.clone()),
             Transform::from_translation(x_shaft_center)
@@ -795,10 +814,7 @@ fn update_selection_highlight(
                 axis: ActiveRotationAxis::Roll,
             },
         ));
-        // Cone at positive X end - cone tip points along +Y by default
         let x_cone_center = device_pos + body_x * (axis_length + cone_height / 2.0);
-        // Rotate cone so its +Y (tip) points along body_x
-        // Use device rotation then rotate -90 around Z to turn Y into X
         let x_cone_rotation = shaft_rotation * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
         commands.spawn((
             Mesh3d(meshes.add(Cone::new(cone_radius, cone_height))),
@@ -812,7 +828,7 @@ fn update_selection_highlight(
             },
         ));
 
-        // Y axis (Pitch/Left - Green) - starts at center, extends along +Y in body frame (FLU)
+        // Y axis (Pitch/Left - Green)
         let y_axis_material = materials.add(StandardMaterial {
             base_color: Color::srgb(0.1, 0.5, 0.1),
             emissive: bevy::color::LinearRgba::new(0.1, 0.5, 0.1, 1.0),
@@ -820,10 +836,8 @@ fn update_selection_highlight(
             alpha_mode: AlphaMode::Blend,
             ..default()
         });
-        // Cuboid elongated along LOCAL Y
         let y_shaft_center = device_pos + body_y * (axis_length / 2.0);
         commands.spawn((
-            // Mesh3d(meshes.add(Cuboid::new(axis_thickness, axis_length, axis_thickness))),
             Mesh3d(meshes.add(Cylinder::new(axis_thickness, axis_length))),
             MeshMaterial3d(y_axis_material.clone()),
             Transform::from_translation(y_shaft_center)
@@ -834,9 +848,8 @@ fn update_selection_highlight(
                 axis: ActiveRotationAxis::Pitch,
             },
         ));
-        // Cone at positive Y end - cone tip already points along +Y, just apply device rotation
         let y_cone_center = device_pos + body_y * (axis_length + cone_height / 2.0);
-        let y_cone_rotation = shaft_rotation; // No extra rotation needed, cone Y aligns with body Y
+        let y_cone_rotation = shaft_rotation;
         commands.spawn((
             Mesh3d(meshes.add(Cone::new(cone_radius, cone_height))),
             MeshMaterial3d(y_axis_material),
@@ -849,7 +862,7 @@ fn update_selection_highlight(
             },
         ));
 
-        // Z axis (Yaw/Up - Blue) - starts at center, extends along +Z in body frame (FLU)
+        // Z axis (Yaw/Up - Blue)
         let z_axis_material = materials.add(StandardMaterial {
             base_color: Color::srgb(0.1, 0.1, 0.5),
             emissive: bevy::color::LinearRgba::new(0.1, 0.1, 0.5, 1.0),
@@ -857,10 +870,8 @@ fn update_selection_highlight(
             alpha_mode: AlphaMode::Blend,
             ..default()
         });
-        // Cuboid elongated along LOCAL Z
         let z_shaft_center = device_pos + body_z * (axis_length / 2.0);
         commands.spawn((
-            // Mesh3d(meshes.add(Cuboid::new(axis_thickness, axis_length, axis_thickness))),
             Mesh3d(meshes.add(Cylinder::new(axis_thickness, axis_length))),
             MeshMaterial3d(z_axis_material.clone()),
             Transform::from_translation(z_shaft_center)
@@ -871,8 +882,6 @@ fn update_selection_highlight(
                 axis: ActiveRotationAxis::Yaw,
             },
         ));
-        // Cone at positive Z end - rotate cone so +Y points along +Z
-        // Rotate +90 around X to turn Y into Z
         let z_cone_center = device_pos + body_z * (axis_length + cone_height / 2.0);
         let z_cone_rotation = shaft_rotation * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
         commands.spawn((
@@ -889,7 +898,6 @@ fn update_selection_highlight(
     }
 
     // Update existing axis indicator positions and rotations to follow the device
-    let axis_exists = axis_query.iter().any(|(_, a, _)| &a.target_device == selected_id);
     if axis_exists {
         // Find device transform
         for (_, device, transform) in device_query.iter() {
@@ -1009,6 +1017,7 @@ fn update_effective_rotation_axis(
     mut commands: Commands,
     selected: Res<SelectedDevice>,
     active_rotation_field: Res<ActiveRotationField>,
+    show_rotation_axis: Res<ShowRotationAxis>,
     orientations: Res<DeviceOrientations>,
     device_query: Query<(&DeviceEntity, &Transform)>,
     effective_axis_query: Query<Entity, With<EffectiveRotationAxis>>,
@@ -1018,6 +1027,11 @@ fn update_effective_rotation_axis(
     // Despawn existing effective axis indicators
     for entity in effective_axis_query.iter() {
         commands.entity(entity).despawn();
+    }
+
+    // Don't show if rotation axis checkbox is unchecked
+    if !show_rotation_axis.0 {
+        return;
     }
 
     // Only show when a device is selected and a rotation field is active
@@ -1261,22 +1275,32 @@ fn update_frame_gizmos(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // First, despawn gizmos for devices that have visibility turned off
+    // First, despawn gizmos for devices/frames that have visibility turned off
     for (entity, gizmo) in frame_gizmo_query.iter() {
-        if !frame_visibility.show_frames_for(&gizmo.device_id) {
+        // Despawn if device frames are hidden OR this specific frame is hidden
+        if !frame_visibility.show_frames_for(&gizmo.device_id)
+            || !frame_visibility.is_frame_visible(&gizmo.device_id, &gizmo.frame_name)
+        {
             commands.entity(entity).despawn();
         }
     }
 
-    // Count expected gizmos (only for devices with visibility on)
+    // Count expected gizmos (only for devices with visibility on AND per-frame visibility)
     let expected_count: usize = registry.devices.iter()
         .filter(|d| frame_visibility.show_frames_for(&d.id))
-        .map(|d| d.frames.len() * 3) // 3 axis entities per frame
+        .map(|d| {
+            d.frames.iter()
+                .filter(|f| frame_visibility.is_frame_visible(&d.id, &f.name))
+                .count() * 3 // 3 axis entities per frame
+        })
         .sum();
 
-    // Count current gizmos for visible devices
+    // Count current gizmos for visible devices and frames
     let current_count = frame_gizmo_query.iter()
-        .filter(|(_, g)| frame_visibility.show_frames_for(&g.device_id))
+        .filter(|(_, g)| {
+            frame_visibility.show_frames_for(&g.device_id)
+                && frame_visibility.is_frame_visible(&g.device_id, &g.frame_name)
+        })
         .count();
 
     // Skip if gizmos already match expected count
@@ -1343,6 +1367,11 @@ fn update_frame_gizmos(
         };
 
         for frame in &device.frames {
+            // Skip frames that are individually hidden
+            if !frame_visibility.is_frame_visible(&device.id, &frame.name) {
+                continue;
+            }
+
             // Parse frame pose (local to device)
             let frame_pose = frame.pose.unwrap_or([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
             let frame_translation = Vec3::new(
@@ -1474,10 +1503,266 @@ fn render_frame_tooltip(
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .show(ui, |ui| {
+                        ui.set_min_width(120.0);
                         ui.label(egui::RichText::new(&frame_name).strong());
                         if !description.is_empty() {
                             ui.label(&description);
                         }
+                    });
+            });
+    }
+}
+
+/// Observer: Handle mouse entering a sensor axis frame
+fn on_sensor_axis_over(
+    trigger: On<Pointer<Over>>,
+    sensor_query: Query<&SensorAxisEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    if let Ok(sensor_axis) = sensor_query.get(entity) {
+        let sensor_key = format!("{}:{}", sensor_axis.device_id, sensor_axis.sensor_name);
+        frame_visibility.hovered_sensor_axis = Some(sensor_key);
+    }
+}
+
+/// Observer: Handle mouse leaving a sensor axis frame
+fn on_sensor_axis_out(
+    trigger: On<Pointer<Out>>,
+    sensor_query: Query<&SensorAxisEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    if sensor_query.get(entity).is_ok() {
+        frame_visibility.hovered_sensor_axis = None;
+    }
+}
+
+/// Observer: Handle mouse entering a sensor FOV geometry
+fn on_sensor_fov_over(
+    trigger: On<Pointer<Over>>,
+    sensor_query: Query<&SensorFovEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    if let Ok(sensor_fov) = sensor_query.get(entity) {
+        let sensor_key = format!("{}:{}", sensor_fov.device_id, sensor_fov.sensor_name);
+        frame_visibility.hovered_sensor_fov = Some(sensor_key);
+    }
+}
+
+/// Observer: Handle mouse leaving a sensor FOV geometry
+fn on_sensor_fov_out(
+    trigger: On<Pointer<Out>>,
+    sensor_query: Query<&SensorFovEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    if sensor_query.get(entity).is_ok() {
+        frame_visibility.hovered_sensor_fov = None;
+    }
+}
+
+/// Render tooltip for hovered sensor axis frame using egui
+fn render_sensor_axis_tooltip(
+    mut contexts: EguiContexts,
+    frame_visibility: Res<FrameVisibility>,
+    sensor_query: Query<&SensorAxisEntity>,
+) {
+    let Some(ref hovered_key) = frame_visibility.hovered_sensor_axis else {
+        return;
+    };
+
+    // Find the sensor axis entity with matching key
+    let mut sensor_name = String::new();
+    let mut category = String::new();
+    let mut sensor_type = String::new();
+    let mut driver: Option<String> = None;
+    let mut axis_align: Option<crate::app::AxisAlignData> = None;
+
+    for sensor in sensor_query.iter() {
+        let key = format!("{}:{}", sensor.device_id, sensor.sensor_name);
+        if &key == hovered_key {
+            sensor_name = sensor.sensor_name.clone();
+            category = sensor.category.clone();
+            sensor_type = sensor.sensor_type.clone();
+            driver = sensor.driver.clone();
+            axis_align = sensor.axis_align.clone();
+            break;
+        }
+    }
+
+    if sensor_name.is_empty() {
+        return;
+    }
+
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::Area::new(egui::Id::new("sensor_axis_tooltip"))
+            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_min_width(150.0);
+                        ui.label(egui::RichText::new(format!("{} (sensor)", sensor_name)).strong());
+                        ui.label(format!("{}/{}", category, sensor_type));
+                        if let Some(ref drv) = driver {
+                            ui.label(format!("Driver: {}", drv));
+                        }
+                        if let Some(ref align) = axis_align {
+                            ui.label(
+                                egui::RichText::new(format!("Axis: X={} Y={} Z={}", align.x, align.y, align.z))
+                                    .color(egui::Color32::YELLOW)
+                            );
+                        }
+                    });
+            });
+    }
+}
+
+/// Render tooltip for hovered sensor FOV using egui
+fn render_sensor_fov_tooltip(
+    mut contexts: EguiContexts,
+    frame_visibility: Res<FrameVisibility>,
+    sensor_query: Query<&SensorFovEntity>,
+) {
+    let Some(ref hovered_key) = frame_visibility.hovered_sensor_fov else {
+        return;
+    };
+
+    // Find the sensor FOV entity with matching key
+    let mut sensor_name = String::new();
+    let mut category = String::new();
+    let mut sensor_type = String::new();
+    let mut driver: Option<String> = None;
+    let mut axis_align: Option<crate::app::AxisAlignData> = None;
+
+    for sensor in sensor_query.iter() {
+        let key = format!("{}:{}", sensor.device_id, sensor.sensor_name);
+        if &key == hovered_key {
+            sensor_name = sensor.sensor_name.clone();
+            category = sensor.category.clone();
+            sensor_type = sensor.sensor_type.clone();
+            driver = sensor.driver.clone();
+            axis_align = sensor.axis_align.clone();
+            break;
+        }
+    }
+
+    if sensor_name.is_empty() {
+        return;
+    }
+
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::Area::new(egui::Id::new("sensor_fov_tooltip"))
+            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_min_width(150.0);
+                        ui.label(egui::RichText::new(format!("{} FOV", sensor_name)).strong());
+                        ui.label(format!("{}/{}", category, sensor_type));
+                        if let Some(ref drv) = driver {
+                            ui.label(format!("Driver: {}", drv));
+                        }
+                        if let Some(ref align) = axis_align {
+                            ui.label(
+                                egui::RichText::new(format!("Axis: X={} Y={} Z={}", align.x, align.y, align.z))
+                                    .color(egui::Color32::YELLOW)
+                            );
+                        }
+                    });
+            });
+    }
+}
+
+/// Observer: Handle mouse entering a port geometry
+fn on_port_over(
+    trigger: On<Pointer<Over>>,
+    port_query: Query<&PortEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    if let Ok(port) = port_query.get(entity) {
+        let port_key = format!("{}:{}", port.device_id, port.port_name);
+        frame_visibility.hovered_port = Some(port_key);
+        frame_visibility.hovered_port_from_ui = false; // Mark as 3D hover
+    }
+}
+
+/// Observer: Handle mouse leaving a port geometry
+fn on_port_out(
+    trigger: On<Pointer<Out>>,
+    port_query: Query<&PortEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    // Only clear if this is a port entity AND hover wasn't set by UI
+    if port_query.get(entity).is_ok() && !frame_visibility.hovered_port_from_ui {
+        frame_visibility.hovered_port = None;
+    }
+}
+
+/// Render tooltip for hovered port using egui
+fn render_port_tooltip(
+    mut contexts: EguiContexts,
+    frame_visibility: Res<FrameVisibility>,
+    port_query: Query<&PortEntity>,
+) {
+    let Some(ref hovered_key) = frame_visibility.hovered_port else {
+        return;
+    };
+
+    // Find the port entity with matching key
+    let mut port_name = String::new();
+    let mut port_type = String::new();
+
+    for port in port_query.iter() {
+        let key = format!("{}:{}", port.device_id, port.port_name);
+        if &key == hovered_key {
+            port_name = port.port_name.clone();
+            port_type = port.port_type.clone();
+            break;
+        }
+    }
+
+    if port_name.is_empty() {
+        return;
+    }
+
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::Area::new(egui::Id::new("port_tooltip"))
+            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_min_width(100.0);
+                        ui.label(egui::RichText::new(&port_name).strong());
+                        // Color the port type like in the UI
+                        let type_color = match port_type.to_lowercase().as_str() {
+                            "ethernet" => egui::Color32::from_rgb(50, 200, 50),
+                            "can" => egui::Color32::from_rgb(255, 200, 50),
+                            "spi" => egui::Color32::from_rgb(200, 50, 200),
+                            "i2c" => egui::Color32::from_rgb(50, 200, 200),
+                            "uart" => egui::Color32::from_rgb(200, 100, 50),
+                            "usb" => egui::Color32::from_rgb(50, 100, 200),
+                            _ => egui::Color32::GRAY,
+                        };
+                        ui.label(egui::RichText::new(&port_type).color(type_color));
                     });
             });
     }

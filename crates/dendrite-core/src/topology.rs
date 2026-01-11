@@ -275,6 +275,8 @@ mod tests {
             pose: None,
             visuals: Vec::new(),
             frames: Vec::new(),
+            ports: Vec::new(),
+            sensors: Vec::new(),
         };
 
         let mut child = Device::new(

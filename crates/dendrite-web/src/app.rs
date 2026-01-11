@@ -39,6 +39,78 @@ pub struct FrameData {
     pub pose: Option<[f64; 6]>,
 }
 
+/// Axis alignment for sensor driver transforms
+#[derive(Debug, Clone)]
+pub struct AxisAlignData {
+    pub x: String,
+    pub y: String,
+    pub z: String,
+}
+
+/// Geometry data for visualization
+#[derive(Debug, Clone)]
+pub enum GeometryData {
+    Box { size: [f64; 3] },
+    Cylinder { radius: f64, length: f64 },
+    Sphere { radius: f64 },
+    /// Deprecated: use ConicalFrustum
+    Cone { radius: f64, length: f64 },
+    /// Deprecated: use PyramidalFrustum
+    Frustum { near: f64, far: f64, hfov: f64, vfov: f64 },
+    /// Conical frustum (circular cross-section FOV)
+    ConicalFrustum { near: f64, far: f64, fov: f64 },
+    /// Pyramidal frustum (rectangular cross-section FOV)
+    PyramidalFrustum { near: f64, far: f64, hfov: f64, vfov: f64 },
+}
+
+/// Field of View data - named FOV with pose, color, and geometry
+#[derive(Debug, Clone)]
+pub struct FovData {
+    /// FOV name (e.g., "emitter", "collector")
+    pub name: String,
+    /// Custom color as RGB (0.0-1.0)
+    pub color: Option<[f32; 3]>,
+    /// Pose offset relative to sensor
+    pub pose: Option<[f64; 6]>,
+    /// FOV geometry
+    pub geometry: Option<GeometryData>,
+}
+
+/// Port data - physical connection interface
+#[derive(Debug, Clone)]
+pub struct PortData {
+    pub name: String,
+    pub port_type: String,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    pub pose: Option<[f64; 6]>,
+    /// Geometry for visualization (fallback if no mesh_name)
+    pub geometry: Vec<GeometryData>,
+    /// Reference to visual containing the mesh (e.g., "board")
+    pub visual_name: Option<String>,
+    /// GLTF mesh node name within the visual (e.g., "port_eth0")
+    pub mesh_name: Option<String>,
+}
+
+/// Sensor data - sensor with pose, axis alignment, and optional FOV geometry
+#[derive(Debug, Clone)]
+pub struct SensorData {
+    pub name: String,
+    /// Sensor category (inertial, em, optical, rf, force, chemical)
+    pub category: String,
+    /// Sensor type within category (accel_gyro, mag, optical_flow, tof, etc.)
+    pub sensor_type: String,
+    /// Driver name (icm45686, bmm350, etc.)
+    pub driver: Option<String>,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    pub pose: Option<[f64; 6]>,
+    /// Axis alignment for driver transforms
+    pub axis_align: Option<AxisAlignData>,
+    /// Legacy: single geometry for FOV visualization (deprecated, use fovs)
+    pub geometry: Option<GeometryData>,
+    /// Multiple named FOVs with individual poses and colors
+    pub fovs: Vec<FovData>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceData {
     pub id: String,
@@ -55,6 +127,10 @@ pub struct DeviceData {
     pub visuals: Vec<VisualData>,
     /// Reference frames for this device
     pub frames: Vec<FrameData>,
+    /// Ports on this device
+    pub ports: Vec<PortData>,
+    /// Sensors on this device
+    pub sensors: Vec<SensorData>,
     pub last_seen: Option<String>,
 }
 
@@ -129,16 +205,54 @@ pub struct ActiveRotationField {
     pub axis: ActiveRotationAxis,
 }
 
+/// Whether to show the rotation axis visualization when editing orientation
+#[derive(Debug, Clone, Resource)]
+pub struct ShowRotationAxis(pub bool);
+
+impl Default for ShowRotationAxis {
+    fn default() -> Self {
+        Self(false) // Hidden by default
+    }
+}
+
 /// Frame and visual visibility settings (per-device)
 #[derive(Debug, Clone, Resource, Default)]
 pub struct FrameVisibility {
     /// Per-device frame visibility (device_id -> show_frames)
+    /// This also controls sensor axis frame visibility
     pub device_frames: std::collections::HashMap<String, bool>,
     /// Currently hovered frame (device_id:frame_name)
     pub hovered_frame: Option<String>,
     /// Per-device, per-toggle-group hidden state: (device_id, toggle_group) -> is_hidden
     /// Default is visible (not hidden), so only hidden groups are tracked
     pub hidden_toggles: std::collections::HashMap<(String, String), bool>,
+    /// Per-device sensor (FOV) visibility (device_id -> show_sensors)
+    pub device_sensors: std::collections::HashMap<String, bool>,
+    /// Currently hovered sensor axis frame (device_id:sensor_name)
+    pub hovered_sensor_axis: Option<String>,
+    /// Currently hovered sensor FOV (device_id:sensor_name)
+    pub hovered_sensor_fov: Option<String>,
+    /// Currently hovered sensor from UI panel (device_id:sensor_name)
+    /// When set, other sensors reduce to 30% alpha
+    pub hovered_sensor_from_ui: Option<String>,
+    /// Per-device port visibility (device_id -> show_ports)
+    pub device_ports: std::collections::HashMap<String, bool>,
+    /// Currently hovered port (device_id:port_name)
+    pub hovered_port: Option<String>,
+    /// Whether the current port hover came from UI (true) or 3D (false)
+    pub hovered_port_from_ui: bool,
+    /// Per-sensor axis alignment mode: (device_id, sensor_name) -> show_aligned
+    /// Default is true (show aligned), false shows raw physical axes
+    pub sensor_axis_aligned: std::collections::HashMap<(String, String), bool>,
+    /// Per-sensor FOV visibility: (device_id, sensor_name) -> show_fov
+    /// Default is true (show FOV), only tracks disabled sensors
+    pub sensor_fov_visible: std::collections::HashMap<(String, String), bool>,
+    /// Per-frame visibility: (device_id, frame_name) -> show_frame
+    /// Default is true (show frame), only tracks disabled frames
+    pub frame_visible: std::collections::HashMap<(String, String), bool>,
+    /// Per-sensor axis visibility: (device_id, sensor_name) -> show_axis
+    /// Default is true (show axis), only tracks disabled sensor axes
+    pub sensor_axis_visible: std::collections::HashMap<(String, String), bool>,
 }
 
 impl FrameVisibility {
@@ -179,6 +293,102 @@ impl FrameVisibility {
         groups.sort();
         groups.dedup();
         groups
+    }
+
+    /// Check if sensors (FOV) should be shown for a specific device
+    pub fn show_sensors_for(&self, device_id: &str) -> bool {
+        self.device_sensors.get(device_id).copied().unwrap_or(false)
+    }
+
+    /// Set sensor (FOV) visibility for a specific device
+    pub fn set_show_sensors(&mut self, device_id: &str, show: bool) {
+        self.device_sensors.insert(device_id.to_string(), show);
+    }
+
+    /// Check if ports should be shown for a specific device
+    pub fn show_ports_for(&self, device_id: &str) -> bool {
+        self.device_ports.get(device_id).copied().unwrap_or(false)
+    }
+
+    /// Set port visibility for a specific device
+    pub fn set_show_ports(&mut self, device_id: &str, show: bool) {
+        self.device_ports.insert(device_id.to_string(), show);
+    }
+
+    /// Check if a sensor should show axis-aligned view (default: true)
+    pub fn is_sensor_axis_aligned(&self, device_id: &str, sensor_name: &str) -> bool {
+        self.sensor_axis_aligned
+            .get(&(device_id.to_string(), sensor_name.to_string()))
+            .copied()
+            .unwrap_or(true) // Default: show aligned
+    }
+
+    /// Set whether a sensor should show axis-aligned view
+    pub fn set_sensor_axis_aligned(&mut self, device_id: &str, sensor_name: &str, aligned: bool) {
+        let key = (device_id.to_string(), sensor_name.to_string());
+        if aligned {
+            // Default is aligned, so remove from map
+            self.sensor_axis_aligned.remove(&key);
+        } else {
+            self.sensor_axis_aligned.insert(key, false);
+        }
+    }
+
+    /// Check if a specific sensor's FOV should be shown (default: true)
+    pub fn is_sensor_fov_visible(&self, device_id: &str, sensor_name: &str) -> bool {
+        self.sensor_fov_visible
+            .get(&(device_id.to_string(), sensor_name.to_string()))
+            .copied()
+            .unwrap_or(true) // Default: show FOV
+    }
+
+    /// Set whether a specific sensor's FOV should be shown
+    pub fn set_sensor_fov_visible(&mut self, device_id: &str, sensor_name: &str, visible: bool) {
+        let key = (device_id.to_string(), sensor_name.to_string());
+        if visible {
+            // Default is visible, so remove from map
+            self.sensor_fov_visible.remove(&key);
+        } else {
+            self.sensor_fov_visible.insert(key, false);
+        }
+    }
+
+    /// Check if a specific named frame should be shown (default: true)
+    pub fn is_frame_visible(&self, device_id: &str, frame_name: &str) -> bool {
+        self.frame_visible
+            .get(&(device_id.to_string(), frame_name.to_string()))
+            .copied()
+            .unwrap_or(true) // Default: show frame
+    }
+
+    /// Set whether a specific named frame should be shown
+    pub fn set_frame_visible(&mut self, device_id: &str, frame_name: &str, visible: bool) {
+        let key = (device_id.to_string(), frame_name.to_string());
+        if visible {
+            // Default is visible, so remove from map
+            self.frame_visible.remove(&key);
+        } else {
+            self.frame_visible.insert(key, false);
+        }
+    }
+
+    /// Check if a specific sensor's axis frame should be shown (default: true)
+    pub fn is_sensor_axis_visible(&self, device_id: &str, sensor_name: &str) -> bool {
+        self.sensor_axis_visible
+            .get(&(device_id.to_string(), sensor_name.to_string()))
+            .copied()
+            .unwrap_or(true) // Default: show axis
+    }
+
+    /// Set whether a specific sensor's axis frame should be shown
+    pub fn set_sensor_axis_visible(&mut self, device_id: &str, sensor_name: &str, visible: bool) {
+        let key = (device_id.to_string(), sensor_name.to_string());
+        if visible {
+            // Default is visible, so remove from map
+            self.sensor_axis_visible.remove(&key);
+        } else {
+            self.sensor_axis_visible.insert(key, false);
+        }
     }
 }
 
@@ -339,6 +549,7 @@ pub fn run() {
         .init_resource::<DevicePositions>()
         .init_resource::<DeviceOrientations>()
         .init_resource::<ActiveRotationField>()
+        .init_resource::<ShowRotationAxis>()
         .init_resource::<FrameVisibility>()
         .init_resource::<WorldSettings>()
         .init_resource::<UiLayout>()

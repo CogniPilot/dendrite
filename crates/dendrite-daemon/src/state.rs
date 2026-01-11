@@ -1,7 +1,8 @@
 //! Application state management
 
 use anyhow::Result;
-use dendrite_core::{Comp, Device, DeviceFrame, DeviceId, DeviceVisual, FragmentDatabase, Hcdf, Topology, parse_pose_string, sha256_hex};
+use dendrite_core::{Comp, Device, DeviceAxisAlign, DeviceFrame, DeviceFov, DeviceGeometry, DeviceId, DevicePort, DeviceSensor, DeviceVisual, FragmentDatabase, Hcdf, Topology, parse_pose_string, sha256_hex};
+use dendrite_core::hcdf::{Geometry, Sensor, Fov};
 use dendrite_discovery::{DiscoveryEvent, DiscoveryScanner};
 use dendrite_mcumgr::query::query_hcdf_info;
 use std::path::Path;
@@ -11,6 +12,15 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::hcdf_fetch::HcdfFetcher;
+
+/// Result of fetching and parsing an HCDF fragment
+#[derive(Debug, Default)]
+struct HcdfFragmentData {
+    visuals: Vec<DeviceVisual>,
+    frames: Vec<DeviceFrame>,
+    ports: Vec<DevicePort>,
+    sensors: Vec<DeviceSensor>,
+}
 
 /// Shared application state
 pub struct AppState {
@@ -107,17 +117,21 @@ impl AppState {
                 // Try to fetch remote HCDF first (MCUmgr query + remote fetch)
                 let remote_fragment = self.try_fetch_remote_hcdf(&device, board, app).await;
 
-                if let Some((visuals, frames)) = remote_fragment {
+                if let Some(fragment_data) = remote_fragment {
                     info!(
                         device = %device.id,
                         board = %board,
                         app = %app,
-                        visuals = visuals.len(),
-                        frames = frames.len(),
+                        visuals = fragment_data.visuals.len(),
+                        frames = fragment_data.frames.len(),
+                        ports = fragment_data.ports.len(),
+                        sensors = fragment_data.sensors.len(),
                         "Applied remote HCDF fragment"
                     );
-                    device.visuals = visuals;
-                    device.frames = frames;
+                    device.visuals = fragment_data.visuals;
+                    device.frames = fragment_data.frames;
+                    device.ports = fragment_data.ports;
+                    device.sensors = fragment_data.sensors;
                 } else {
                     // Fall back to local fragment database
                     let mut fragments = self.fragments.write().await;
@@ -150,6 +164,23 @@ impl AppState {
                                 pose: f.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
                             }
                         }).collect();
+
+                        // Convert fragment ports to device ports
+                        device.ports = fragment.ports.iter().map(|p| {
+                            DevicePort {
+                                name: p.name.clone(),
+                                port_type: p.port_type.clone(),
+                                pose: p.pose.as_ref().and_then(|pose| parse_pose_string(pose)).map(|pose| pose.to_array()),
+                                geometry: p.geometry.iter().filter_map(convert_geometry).collect(),
+                                visual_name: p.visual.clone(),
+                                mesh_name: p.mesh.clone(),
+                            }
+                        }).collect();
+
+                        // Convert fragment sensors to device sensors
+                        device.sensors = fragment.sensors.iter()
+                            .flat_map(convert_sensor)
+                            .collect();
                     }
                 }
 
@@ -160,7 +191,7 @@ impl AppState {
                 }
 
                 // Update the device in the scanner silently (don't trigger new events)
-                if !device.visuals.is_empty() {
+                if !device.visuals.is_empty() || !device.ports.is_empty() || !device.sensors.is_empty() {
                     self.scanner.update_device_silent(device.clone()).await;
                 }
             }
@@ -223,13 +254,13 @@ impl AppState {
     /// 1. Query device via MCUmgr for HCDF URL + SHA
     /// 2. If device doesn't support HCDF group, construct fallback URL from board/app
     /// 3. Fetch HCDF (using cache if SHA matches)
-    /// 4. Parse and return visuals/frames
+    /// 4. Parse and return visuals, frames, ports, and sensors
     async fn try_fetch_remote_hcdf(
         &self,
         device: &Device,
         board: &str,
         app: &str,
-    ) -> Option<(Vec<DeviceVisual>, Vec<DeviceFrame>)> {
+    ) -> Option<HcdfFragmentData> {
         // Try to query HCDF info from device via MCUmgr
         let (device_url, device_sha) = match query_hcdf_info(device.discovery.ip, device.discovery.port).await {
             Ok(Some(info)) => {
@@ -303,6 +334,9 @@ impl AppState {
                     visual: m.visual,
                     frame: m.frame,
                     network: m.network,
+                    port: Vec::new(),
+                    antenna: Vec::new(),
+                    sensor: Vec::new(),
                 })
             })?;
 
@@ -313,36 +347,16 @@ impl AppState {
                 // Resolve the model URL
                 let model_url = resolve_model_url(&model_ref.href, &root_url);
 
-                // Fetch and cache the model
-                match self.hcdf_fetcher.fetch_model(
+                // Fetch and cache the model (for local serving)
+                // But always return the remote URL for frontend to load directly
+                // This ensures the frontend can load from hcdf.cognipilot.org over HTTPS
+                let _ = self.hcdf_fetcher.fetch_model(
                     &model_url,
                     model_ref.sha.as_deref(),
                     &hcdf_sha,
-                ).await {
-                    Ok(Some(cached_path)) => {
-                        // Return path relative to /models/ endpoint (strip "models/" prefix)
-                        let path = cached_path.strip_prefix("models/").unwrap_or(&cached_path);
-                        Some(path.to_string())
-                    }
-                    Ok(None) => {
-                        // Fallback to remote URL if caching fails
-                        warn!(
-                            device = %device.id,
-                            model = %model_ref.href,
-                            "Failed to cache model, using remote URL"
-                        );
-                        Some(model_url)
-                    }
-                    Err(e) => {
-                        warn!(
-                            device = %device.id,
-                            model = %model_ref.href,
-                            error = %e,
-                            "Error fetching model, using remote URL"
-                        );
-                        Some(resolve_model_url(&model_ref.href, &root_url))
-                    }
-                }
+                ).await;
+
+                Some(model_url)
             } else {
                 None
             };
@@ -364,11 +378,28 @@ impl AppState {
             }
         }).collect();
 
-        if visuals.is_empty() && frames.is_empty() {
+        // Convert ports
+        let ports: Vec<DevicePort> = comp.port.iter().map(|p| {
+            DevicePort {
+                name: p.name.clone(),
+                port_type: p.port_type.clone(),
+                pose: p.pose.as_ref().and_then(|pose| parse_pose_string(pose)).map(|pose| pose.to_array()),
+                geometry: p.geometry.iter().filter_map(convert_geometry).collect(),
+                visual_name: p.visual.clone(),
+                mesh_name: p.mesh.clone(),
+            }
+        }).collect();
+
+        // Convert sensors
+        let sensors: Vec<DeviceSensor> = comp.sensor.iter()
+            .flat_map(convert_sensor)
+            .collect();
+
+        if visuals.is_empty() && frames.is_empty() && ports.is_empty() && sensors.is_empty() {
             return None;
         }
 
-        Some((visuals, frames))
+        Some(HcdfFragmentData { visuals, frames, ports, sensors })
     }
 }
 
@@ -398,6 +429,183 @@ fn resolve_model_url(model_path: &str, root_url: &str) -> String {
 
     // Models are at the root level of the domain (e.g., /models/...)
     format!("{}{}", root_url, path)
+}
+
+/// Convert HCDF Geometry to DeviceGeometry
+fn convert_geometry(geom: &Geometry) -> Option<DeviceGeometry> {
+    if let Some(ref box_geom) = geom.box_geom {
+        // Parse size string "x y z" to [f64; 3]
+        let parts: Vec<f64> = box_geom.size
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if parts.len() >= 3 {
+            return Some(DeviceGeometry::Box { size: [parts[0], parts[1], parts[2]] });
+        }
+    }
+    if let Some(ref cyl) = geom.cylinder {
+        return Some(DeviceGeometry::Cylinder { radius: cyl.radius, length: cyl.length });
+    }
+    if let Some(ref sphere) = geom.sphere {
+        return Some(DeviceGeometry::Sphere { radius: sphere.radius });
+    }
+    // New types first (preferred)
+    if let Some(ref cf) = geom.conical_frustum {
+        return Some(DeviceGeometry::ConicalFrustum {
+            near: cf.near,
+            far: cf.far,
+            fov: cf.fov,
+        });
+    }
+    if let Some(ref pf) = geom.pyramidal_frustum {
+        return Some(DeviceGeometry::PyramidalFrustum {
+            near: pf.near,
+            far: pf.far,
+            hfov: pf.hfov,
+            vfov: pf.vfov,
+        });
+    }
+    // Legacy types (deprecated)
+    if let Some(ref cone) = geom.cone {
+        return Some(DeviceGeometry::Cone { radius: cone.radius, length: cone.length });
+    }
+    if let Some(ref frustum) = geom.frustum {
+        return Some(DeviceGeometry::Frustum {
+            near: frustum.near,
+            far: frustum.far,
+            hfov: frustum.hfov,
+            vfov: frustum.vfov,
+        });
+    }
+    None
+}
+
+/// Convert HCDF Sensor to DeviceSensor entries
+fn convert_sensor(sensor: &Sensor) -> Vec<DeviceSensor> {
+    let mut results = Vec::new();
+
+    // Process inertial sensors
+    for inertial in &sensor.inertial {
+        results.push(DeviceSensor {
+            name: sensor.name.clone(),
+            category: "inertial".to_string(),
+            sensor_type: inertial.sensor_type.clone(),
+            driver: inertial.driver.as_ref().map(|d| d.name.clone()),
+            pose: inertial.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            axis_align: inertial.driver.as_ref()
+                .and_then(|d| d.axis_align.as_ref())
+                .map(|a| DeviceAxisAlign {
+                    x: a.x.clone(),
+                    y: a.y.clone(),
+                    z: a.z.clone(),
+                }),
+            geometry: inertial.geometry.as_ref().and_then(convert_geometry),
+            fovs: Vec::new(),
+        });
+    }
+
+    // Process EM sensors (magnetometer)
+    for em in &sensor.em {
+        results.push(DeviceSensor {
+            name: sensor.name.clone(),
+            category: "em".to_string(),
+            sensor_type: em.sensor_type.clone(),
+            driver: em.driver.as_ref().map(|d| d.name.clone()),
+            pose: em.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            axis_align: em.driver.as_ref()
+                .and_then(|d| d.axis_align.as_ref())
+                .map(|a| DeviceAxisAlign {
+                    x: a.x.clone(),
+                    y: a.y.clone(),
+                    z: a.z.clone(),
+                }),
+            geometry: em.geometry.as_ref().and_then(convert_geometry),
+            fovs: Vec::new(),
+        });
+    }
+
+    // Process optical sensors (camera, lidar, tof, optical_flow)
+    for optical in &sensor.optical {
+        // Convert FOVs if present
+        let fovs: Vec<DeviceFov> = optical.fov.iter().map(|f| convert_fov(f)).collect();
+
+        results.push(DeviceSensor {
+            name: sensor.name.clone(),
+            category: "optical".to_string(),
+            sensor_type: optical.sensor_type.clone(),
+            driver: optical.driver.as_ref().map(|d| d.name.clone()),
+            pose: optical.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            axis_align: optical.driver.as_ref()
+                .and_then(|d| d.axis_align.as_ref())
+                .map(|a| DeviceAxisAlign {
+                    x: a.x.clone(),
+                    y: a.y.clone(),
+                    z: a.z.clone(),
+                }),
+            geometry: optical.geometry.as_ref().and_then(convert_geometry),
+            fovs,
+        });
+    }
+
+    // Process RF sensors (GNSS, UWB, radar)
+    for rf in &sensor.rf {
+        results.push(DeviceSensor {
+            name: sensor.name.clone(),
+            category: "rf".to_string(),
+            sensor_type: rf.sensor_type.clone(),
+            driver: rf.driver.as_ref().map(|d| d.name.clone()),
+            pose: rf.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            axis_align: rf.driver.as_ref()
+                .and_then(|d| d.axis_align.as_ref())
+                .map(|a| DeviceAxisAlign {
+                    x: a.x.clone(),
+                    y: a.y.clone(),
+                    z: a.z.clone(),
+                }),
+            geometry: rf.geometry.as_ref().and_then(convert_geometry),
+            fovs: Vec::new(),
+        });
+    }
+
+    // Process chemical sensors
+    for chem in &sensor.chemical {
+        results.push(DeviceSensor {
+            name: sensor.name.clone(),
+            category: "chemical".to_string(),
+            sensor_type: chem.sensor_type.clone(),
+            driver: chem.driver.as_ref().map(|d| d.name.clone()),
+            pose: chem.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            axis_align: None, // Chemical sensors don't have axis alignment
+            geometry: chem.geometry.as_ref().and_then(convert_geometry),
+            fovs: Vec::new(),
+        });
+    }
+
+    // Process force sensors (pressure, strain, torque, load cell)
+    for force in &sensor.force {
+        results.push(DeviceSensor {
+            name: sensor.name.clone(),
+            category: "force".to_string(),
+            sensor_type: force.sensor_type.clone(),
+            driver: force.driver.as_ref().map(|d| d.name.clone()),
+            pose: force.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| p.to_array()),
+            axis_align: None, // Force sensors typically don't have axis alignment
+            geometry: force.geometry.as_ref().and_then(convert_geometry),
+            fovs: Vec::new(),
+        });
+    }
+
+    results
+}
+
+/// Convert HCDF Fov to DeviceFov
+fn convert_fov(fov: &Fov) -> DeviceFov {
+    DeviceFov {
+        name: fov.name.clone(),
+        color: fov.parse_color().map(|(r, g, b)| [r, g, b]),
+        pose: fov.parse_pose().map(|p| p.to_array()),
+        geometry: fov.geometry.as_ref().and_then(convert_geometry),
+    }
 }
 
 /// Load HCDF from file or create new

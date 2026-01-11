@@ -153,6 +153,123 @@ pub struct DeviceFrame {
     pub pose: Option<[f64; 6]>,
 }
 
+/// Geometry for visualization (box, cylinder, sphere, cone, frustum)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DeviceGeometry {
+    /// Box geometry with size (x, y, z)
+    Box { size: [f64; 3] },
+    /// Cylinder geometry with radius and length
+    Cylinder { radius: f64, length: f64 },
+    /// Sphere geometry with radius
+    Sphere { radius: f64 },
+    /// Cone geometry (deprecated, use conical_frustum)
+    Cone { radius: f64, length: f64 },
+    /// Frustum geometry (deprecated, use pyramidal_frustum)
+    Frustum { near: f64, far: f64, hfov: f64, vfov: f64 },
+    /// Conical frustum (circular cross-section FOV)
+    ConicalFrustum { near: f64, far: f64, fov: f64 },
+    /// Pyramidal frustum (rectangular cross-section FOV)
+    PyramidalFrustum { near: f64, far: f64, hfov: f64, vfov: f64 },
+}
+
+/// Port on a device (ethernet, CAN, SPI, I2C, UART, USB)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicePort {
+    /// Port name (e.g., "ETH0", "CAN0")
+    pub name: String,
+    /// Port type (e.g., "ethernet", "CAN", "SPI")
+    pub port_type: String,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    /// Geometry for visualization
+    #[serde(default)]
+    pub geometry: Vec<DeviceGeometry>,
+    /// Reference to visual containing the mesh (e.g., "board")
+    #[serde(default)]
+    pub visual_name: Option<String>,
+    /// GLTF mesh node name within the visual (e.g., "port_eth0")
+    #[serde(default)]
+    pub mesh_name: Option<String>,
+}
+
+/// Axis alignment for sensor driver transforms
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceAxisAlign {
+    /// X axis mapping (e.g., "X", "-X", "Y", "-Y", "Z", "-Z")
+    pub x: String,
+    /// Y axis mapping
+    pub y: String,
+    /// Z axis mapping
+    pub z: String,
+}
+
+impl DeviceAxisAlign {
+    /// Convert axis alignment to a 3x3 rotation matrix
+    pub fn to_rotation_matrix(&self) -> Option<[[f32; 3]; 3]> {
+        let parse_axis = |s: &str| -> Option<[f32; 3]> {
+            match s.trim() {
+                "X" => Some([1.0, 0.0, 0.0]),
+                "-X" => Some([-1.0, 0.0, 0.0]),
+                "Y" => Some([0.0, 1.0, 0.0]),
+                "-Y" => Some([0.0, -1.0, 0.0]),
+                "Z" => Some([0.0, 0.0, 1.0]),
+                "-Z" => Some([0.0, 0.0, -1.0]),
+                _ => None,
+            }
+        };
+
+        let row_x = parse_axis(&self.x)?;
+        let row_y = parse_axis(&self.y)?;
+        let row_z = parse_axis(&self.z)?;
+
+        Some([row_x, row_y, row_z])
+    }
+}
+
+/// Field of View for a sensor (named FOV with pose, color, and geometry)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceFov {
+    /// FOV name (e.g., "emitter", "collector", "left", "right")
+    pub name: String,
+    /// Custom color as RGB (0.0-1.0)
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
+    /// Pose offset relative to sensor: (x, y, z, roll, pitch, yaw)
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    /// FOV geometry
+    #[serde(default)]
+    pub geometry: Option<DeviceGeometry>,
+}
+
+/// Sensor on a device
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceSensor {
+    /// Sensor name (e.g., "imu_hub", "mag_hub")
+    pub name: String,
+    /// Sensor category (e.g., "inertial", "em", "optical", "rf", "force")
+    pub category: String,
+    /// Sensor type within category (e.g., "accel_gyro", "mag", "optical_flow")
+    pub sensor_type: String,
+    /// Driver name (e.g., "icm45686", "bmm350")
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    #[serde(default)]
+    pub pose: Option<[f64; 6]>,
+    /// Driver axis alignment (transforms from hardware to board frame)
+    #[serde(default)]
+    pub axis_align: Option<DeviceAxisAlign>,
+    /// Legacy: single geometry for visualization (deprecated, use fovs)
+    #[serde(default)]
+    pub geometry: Option<DeviceGeometry>,
+    /// Multiple named FOVs with individual poses and colors
+    #[serde(default)]
+    pub fovs: Vec<DeviceFov>,
+}
+
 impl Default for DeviceInfo {
     fn default() -> Self {
         Self {
@@ -192,6 +309,12 @@ pub struct Device {
     /// Reference frames for this device
     #[serde(default)]
     pub frames: Vec<DeviceFrame>,
+    /// Ports on this device (ethernet, CAN, SPI, etc.)
+    #[serde(default)]
+    pub ports: Vec<DevicePort>,
+    /// Sensors on this device
+    #[serde(default)]
+    pub sensors: Vec<DeviceSensor>,
 }
 
 impl Device {
@@ -218,6 +341,8 @@ impl Device {
             pose: None,
             visuals: Vec::new(),
             frames: Vec::new(),
+            ports: Vec::new(),
+            sensors: Vec::new(),
         }
     }
 

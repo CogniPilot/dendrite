@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::hcdf::{Comp, Frame, Hcdf, Visual};
+use crate::hcdf::{Comp, Frame, Hcdf, Port, Sensor, Visual};
 
 #[derive(Error, Debug)]
 pub enum FragmentError {
@@ -42,7 +42,7 @@ pub struct FragmentIndexEntry {
     pub hcdf: String,
 }
 
-/// A loaded fragment with all its visuals and frames
+/// A loaded fragment with all its visuals, frames, ports, and sensors
 #[derive(Debug, Clone)]
 pub struct Fragment {
     /// Board type this fragment matches
@@ -59,6 +59,10 @@ pub struct Fragment {
     pub visuals: Vec<Visual>,
     /// Reference frames for this component
     pub frames: Vec<Frame>,
+    /// Ports on this component (ethernet, CAN, SPI, etc.)
+    pub ports: Vec<Port>,
+    /// Sensors on this component
+    pub sensors: Vec<Sensor>,
     /// Path to the source HCDF file
     pub hcdf_path: PathBuf,
 }
@@ -221,6 +225,9 @@ impl FragmentDatabase {
                     visual: m.visual,
                     frame: m.frame,
                     network: m.network,
+                    port: Vec::new(),
+                    antenna: Vec::new(),
+                    sensor: Vec::new(),
                 })
             })
             .ok_or_else(|| FragmentError::NoComp(path.display().to_string()))?;
@@ -233,6 +240,8 @@ impl FragmentDatabase {
             mass: comp.mass,
             visuals: comp.visual,
             frames: comp.frame,
+            ports: comp.port,
+            sensors: comp.sensor,
             hcdf_path: path.to_path_buf(),
         })
     }
@@ -336,6 +345,9 @@ impl FragmentDatabase {
                     visual: m.visual,
                     frame: m.frame,
                     network: m.network,
+                    port: Vec::new(),
+                    antenna: Vec::new(),
+                    sensor: Vec::new(),
                 })
             })
             .ok_or_else(|| FragmentError::NoComp(source_path.display().to_string()))?;
@@ -348,6 +360,8 @@ impl FragmentDatabase {
             mass: comp.mass,
             visuals: comp.visual,
             frames: comp.frame,
+            ports: comp.port,
+            sensors: comp.sensor,
             hcdf_path: source_path.clone(),
         };
 

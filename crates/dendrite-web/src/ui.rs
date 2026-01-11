@@ -3,7 +3,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FrameVisibility, SelectedDevice, UiLayout, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FrameVisibility, SelectedDevice, ShowRotationAxis, UiLayout, WorldSettings};
 use crate::network::{DaemonConfig, HeartbeatState, NetworkInterfaces, ReconnectEvent, toggle_heartbeat, trigger_scan_on_interface};
 
 pub struct UiPlugin;
@@ -42,7 +42,7 @@ fn ui_system(
     mut camera_settings: ResMut<CameraSettings>,
     mut positions: ResMut<DevicePositions>,
     mut orientations: ResMut<DeviceOrientations>,
-    mut active_rotation_field: ResMut<ActiveRotationField>,
+    mut rotation_state: (ResMut<ActiveRotationField>, ResMut<ShowRotationAxis>),
     mut world_settings: ResMut<WorldSettings>,
     mut frame_visibility: ResMut<FrameVisibility>,
     mut device_query: Query<(&crate::scene::DeviceEntity, &mut Transform)>,
@@ -53,6 +53,7 @@ fn ui_system(
     mut connection_dialog: ResMut<ConnectionDialog>,
     mut reconnect_events: MessageWriter<ReconnectEvent>,
 ) {
+    let (ref mut active_rotation_field, ref mut show_rotation_axis) = rotation_state;
     let is_mobile = ui_layout.is_mobile;
     let panel_width = ui_layout.panel_width();
     let ui_scale = ui_layout.ui_scale;
@@ -516,6 +517,13 @@ fn ui_system(
                                         }
                                     }
 
+                                    // Show rotation axis checkbox (unchecked by default)
+                                    ui.label("Show Rotation Axis:");
+                                    if ui.checkbox(&mut show_rotation_axis.0, "").changed() {
+                                        // Value already updated by checkbox
+                                    }
+                                    ui.end_row();
+
                                     // Show orientation from 3D scene
                                     // Get stored Euler angles (these are display values, not used to compute rotation)
                                     let orient = orientations.orientations.get(&id).cloned().unwrap_or(Vec3::ZERO);
@@ -602,17 +610,347 @@ fn ui_system(
 
                             ui.separator();
 
-                            // Per-device frame visibility toggle (only if device has frames)
-                            if !device.frames.is_empty() {
+                            // Per-device frame visibility toggle (if device has frames or sensors)
+                            // Sensor axis frames are also controlled by this toggle
+                            let frame_count = device.frames.len();
+                            let sensor_count = device.sensors.len();
+                            if frame_count > 0 || sensor_count > 0 {
                                 let mut show_frames = frame_visibility.show_frames_for(&id);
                                 if ui.checkbox(&mut show_frames, "Show Reference Frames").changed() {
                                     frame_visibility.set_show_frames(&id, show_frames);
                                 }
+                                // Build description showing both frame and sensor counts
+                                let description = match (frame_count, sensor_count) {
+                                    (0, s) => format!("{} sensor frame(s)", s),
+                                    (f, 0) => format!("{} frame(s) defined", f),
+                                    (f, s) => format!("{} frame(s) + {} sensor", f, s),
+                                };
                                 ui.label(
-                                    egui::RichText::new(format!("{} frame(s) defined", device.frames.len()))
+                                    egui::RichText::new(description)
                                         .size(11.0 * ui_scale)
                                         .color(egui::Color32::GRAY)
                                 );
+
+                                // Individual frame toggles (collapsible, only shown when frames are enabled)
+                                if show_frames && (frame_count > 0 || sensor_count > 0) {
+                                    let header_text = format!("Frame Details ({})", frame_count + sensor_count);
+                                    egui::CollapsingHeader::new(egui::RichText::new(&header_text).size(12.0 * ui_scale))
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            // Named frames section
+                                            if frame_count > 0 {
+                                                ui.label(
+                                                    egui::RichText::new("Named Frames")
+                                                        .size(10.0 * ui_scale)
+                                                        .color(egui::Color32::GRAY)
+                                                );
+                                                for frame in &device.frames {
+                                                    ui.horizontal(|ui| {
+                                                        let mut frame_vis = frame_visibility.is_frame_visible(&id, &frame.name);
+                                                        if ui.checkbox(&mut frame_vis, "").changed() {
+                                                            frame_visibility.set_frame_visible(&id, &frame.name, frame_vis);
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new(&frame.name)
+                                                                .size(11.0 * ui_scale)
+                                                                .color(egui::Color32::LIGHT_GREEN)
+                                                        );
+                                                    });
+                                                    // Show description if available
+                                                    if let Some(ref desc) = frame.description {
+                                                        ui.indent("frame_desc", |ui| {
+                                                            ui.label(
+                                                                egui::RichText::new(desc)
+                                                                    .size(9.0 * ui_scale)
+                                                                    .color(egui::Color32::GRAY)
+                                                            );
+                                                        });
+                                                    }
+                                                }
+                                            }
+
+                                            // Sensor axis frames section
+                                            if sensor_count > 0 {
+                                                if frame_count > 0 {
+                                                    ui.add_space(4.0);
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new("Sensor Frames")
+                                                        .size(10.0 * ui_scale)
+                                                        .color(egui::Color32::GRAY)
+                                                );
+                                                let mut any_sensor_hovered_in_frames = false;
+                                                for sensor in &device.sensors {
+                                                    let sensor_key = format!("{}:{}", id, sensor.name);
+                                                    let is_hovered = frame_visibility.hovered_sensor_from_ui.as_ref() == Some(&sensor_key);
+
+                                                    // Highlight color when hovered
+                                                    let name_color = if is_hovered {
+                                                        egui::Color32::WHITE
+                                                    } else {
+                                                        egui::Color32::LIGHT_BLUE
+                                                    };
+
+                                                    ui.horizontal(|ui| {
+                                                        let mut axis_vis = frame_visibility.is_sensor_axis_visible(&id, &sensor.name);
+                                                        if ui.checkbox(&mut axis_vis, "").changed() {
+                                                            frame_visibility.set_sensor_axis_visible(&id, &sensor.name, axis_vis);
+                                                        }
+
+                                                        // Use selectable_label for hover detection
+                                                        let response = ui.selectable_label(
+                                                            is_hovered,
+                                                            egui::RichText::new(&sensor.name)
+                                                                .size(11.0 * ui_scale)
+                                                                .color(name_color)
+                                                        );
+
+                                                        // Track hover state
+                                                        if response.hovered() {
+                                                            frame_visibility.hovered_sensor_from_ui = Some(sensor_key);
+                                                            any_sensor_hovered_in_frames = true;
+                                                        }
+                                                    });
+                                                }
+
+                                                // Clear hover if no sensor in this device's frame section is hovered
+                                                if !any_sensor_hovered_in_frames {
+                                                    if let Some(ref hovered) = frame_visibility.hovered_sensor_from_ui.clone() {
+                                                        if hovered.starts_with(&format!("{}:", id)) {
+                                                            frame_visibility.hovered_sensor_from_ui = None;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                }
+
+                                ui.separator();
+                            }
+
+                            // Per-device sensor visibility toggle (only if device has sensors with FOV)
+                            if !device.sensors.is_empty() {
+                                // Count sensors with FOV (visualizable) - check both legacy geometry and new fovs
+                                let fov_sensor_count = device.sensors.iter()
+                                    .filter(|s| s.geometry.is_some() || !s.fovs.is_empty())
+                                    .count();
+
+                                // Show Sensors checkbox controls FOV visualization
+                                if fov_sensor_count > 0 {
+                                    let mut show_sensors = frame_visibility.show_sensors_for(&id);
+                                    if ui.checkbox(&mut show_sensors, "Show Sensors").changed() {
+                                        frame_visibility.set_show_sensors(&id, show_sensors);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!("{} sensor(s) with FOV", fov_sensor_count))
+                                            .size(11.0 * ui_scale)
+                                            .color(egui::Color32::GRAY)
+                                    );
+                                }
+
+                                // Collapsible sensor list with details
+                                let header_text = format!("Sensor Details ({})", device.sensors.len());
+                                egui::CollapsingHeader::new(egui::RichText::new(&header_text).size(12.0 * ui_scale))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Sensor axes shown with Reference Frames")
+                                                .size(10.0 * ui_scale)
+                                                .color(egui::Color32::GRAY)
+                                        );
+                                        let mut any_sensor_hovered = false;
+                                        for sensor in &device.sensors {
+                                            let sensor_key = format!("{}:{}", id, sensor.name);
+                                            let is_hovered = frame_visibility.hovered_sensor_from_ui.as_ref() == Some(&sensor_key);
+                                            let has_fov = sensor.geometry.is_some() || !sensor.fovs.is_empty();
+                                            // Highlight color when hovered
+                                            let name_color = if is_hovered {
+                                                egui::Color32::WHITE
+                                            } else if has_fov {
+                                                egui::Color32::LIGHT_BLUE
+                                            } else {
+                                                egui::Color32::LIGHT_GRAY
+                                            };
+
+                                            // Build sensor label text
+                                            let label_text = if has_fov {
+                                                format!("{} (FOV)", sensor.name)
+                                            } else {
+                                                sensor.name.clone()
+                                            };
+
+                                            // Use selectable_label for built-in hover detection
+                                            let response = ui.selectable_label(
+                                                is_hovered,
+                                                egui::RichText::new(&label_text)
+                                                    .size(12.0 * ui_scale)
+                                                    .color(name_color)
+                                            );
+
+                                            // Track hover state
+                                            if response.hovered() {
+                                                frame_visibility.hovered_sensor_from_ui = Some(sensor_key);
+                                                any_sensor_hovered = true;
+                                            }
+                                            ui.indent("sensor_detail", |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!("{}/{}", sensor.category, sensor.sensor_type))
+                                                        .size(10.0 * ui_scale)
+                                                        .color(egui::Color32::GRAY)
+                                                );
+                                                if let Some(ref driver) = sensor.driver {
+                                                    ui.label(
+                                                        egui::RichText::new(format!("Driver: {}", driver))
+                                                            .size(10.0 * ui_scale)
+                                                            .color(egui::Color32::GRAY)
+                                                    );
+                                                }
+                                                // Per-sensor FOV visibility toggle (only for sensors with FOV)
+                                                if has_fov {
+                                                    ui.horizontal(|ui| {
+                                                        let mut show_fov = frame_visibility.is_sensor_fov_visible(&id, &sensor.name);
+                                                        if ui.checkbox(&mut show_fov, "").changed() {
+                                                            frame_visibility.set_sensor_fov_visible(&id, &sensor.name, show_fov);
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new("Show FOV")
+                                                                .size(10.0 * ui_scale)
+                                                                .color(egui::Color32::LIGHT_BLUE)
+                                                        );
+                                                    });
+                                                    // Show individual FOV names with their colors
+                                                    if !sensor.fovs.is_empty() {
+                                                        ui.indent("fov_list", |ui| {
+                                                            for fov in &sensor.fovs {
+                                                                let fov_color = if let Some(c) = fov.color {
+                                                                    egui::Color32::from_rgb(
+                                                                        (c[0] * 255.0) as u8,
+                                                                        (c[1] * 255.0) as u8,
+                                                                        (c[2] * 255.0) as u8,
+                                                                    )
+                                                                } else {
+                                                                    egui::Color32::LIGHT_BLUE
+                                                                };
+                                                                ui.horizontal(|ui| {
+                                                                    // Color swatch
+                                                                    let (rect, _) = ui.allocate_exact_size(
+                                                                        egui::vec2(10.0 * ui_scale, 10.0 * ui_scale),
+                                                                        egui::Sense::hover(),
+                                                                    );
+                                                                    ui.painter().rect_filled(rect, 2.0, fov_color);
+                                                                    // FOV name
+                                                                    ui.label(
+                                                                        egui::RichText::new(&fov.name)
+                                                                            .size(9.0 * ui_scale)
+                                                                            .color(fov_color)
+                                                                    );
+                                                                });
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                                // Axis alignment toggle (only for sensors with axis_align)
+                                                if let Some(ref axis_align) = sensor.axis_align {
+                                                    ui.horizontal(|ui| {
+                                                        let mut show_aligned = frame_visibility.is_sensor_axis_aligned(&id, &sensor.name);
+                                                        if ui.checkbox(&mut show_aligned, "").changed() {
+                                                            frame_visibility.set_sensor_axis_aligned(&id, &sensor.name, show_aligned);
+                                                        }
+                                                        let label_text = if show_aligned {
+                                                            format!("Aligned: X={} Y={} Z={}", axis_align.x, axis_align.y, axis_align.z)
+                                                        } else {
+                                                            "Raw axes".to_string()
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(label_text)
+                                                                .size(10.0 * ui_scale)
+                                                                .color(egui::Color32::YELLOW)
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                        }
+
+                                        // Clear hover if no sensor in this device is hovered
+                                        if !any_sensor_hovered {
+                                            if let Some(ref hovered) = frame_visibility.hovered_sensor_from_ui.clone() {
+                                                if hovered.starts_with(&format!("{}:", id)) {
+                                                    frame_visibility.hovered_sensor_from_ui = None;
+                                                }
+                                            }
+                                        }
+                                    });
+                                ui.separator();
+                            }
+
+                            // Per-device port visibility toggle (only if device has ports)
+                            if !device.ports.is_empty() {
+                                let mut show_ports = frame_visibility.show_ports_for(&id);
+                                if ui.checkbox(&mut show_ports, "Show Ports").changed() {
+                                    frame_visibility.set_show_ports(&id, show_ports);
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("{} port(s)", device.ports.len()))
+                                        .size(11.0 * ui_scale)
+                                        .color(egui::Color32::GRAY)
+                                );
+
+                                // Show port details when enabled
+                                if show_ports {
+                                    let mut any_port_hovered = false;
+                                    ui.indent("ports", |ui| {
+                                        for port in &device.ports {
+                                            let port_key = format!("{}:{}", id, port.name);
+                                            let is_hovered = frame_visibility.hovered_port.as_ref() == Some(&port_key);
+                                            let port_color = match port.port_type.to_lowercase().as_str() {
+                                                "ethernet" => egui::Color32::from_rgb(50, 200, 50),
+                                                "can" => egui::Color32::from_rgb(255, 200, 50),
+                                                "spi" => egui::Color32::from_rgb(200, 50, 200),
+                                                "i2c" => egui::Color32::from_rgb(50, 200, 200),
+                                                "uart" => egui::Color32::from_rgb(200, 100, 50),
+                                                "usb" => egui::Color32::from_rgb(50, 100, 200),
+                                                _ => egui::Color32::GRAY,
+                                            };
+                                            // Highlight text if hovered (either from UI or 3D view)
+                                            let display_color = if is_hovered {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                port_color
+                                            };
+
+                                            // Build port label text
+                                            let label_text = format!("{} ({})", port.name, port.port_type);
+
+                                            // Use selectable_label for built-in hover detection
+                                            let response = ui.selectable_label(
+                                                is_hovered,
+                                                egui::RichText::new(&label_text)
+                                                    .size(12.0 * ui_scale)
+                                                    .color(display_color)
+                                            );
+
+                                            // Set hovered_port when hovering over port name in UI
+                                            if response.hovered() {
+                                                frame_visibility.hovered_port = Some(port_key);
+                                                frame_visibility.hovered_port_from_ui = true;
+                                                any_port_hovered = true;
+                                            }
+                                        }
+                                    });
+
+                                    // Clear hovered_port only if:
+                                    // 1. No port in this UI list is hovered, AND
+                                    // 2. The hover was set by UI (not 3D), AND
+                                    // 3. The currently hovered port belongs to this device
+                                    if !any_port_hovered && frame_visibility.hovered_port_from_ui {
+                                        if let Some(ref hovered) = frame_visibility.hovered_port.clone() {
+                                            if hovered.starts_with(&format!("{}:", id)) {
+                                                frame_visibility.hovered_port = None;
+                                                frame_visibility.hovered_port_from_ui = false;
+                                            }
+                                        }
+                                    }
+                                }
                                 ui.separator();
                             }
 

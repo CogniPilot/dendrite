@@ -226,7 +226,11 @@ impl FragmentCache {
 
     /// Check if we have a cached HCDF with the given SHA
     pub fn has_hcdf(&self, sha: &str) -> bool {
-        self.manifest.has_hcdf(sha) && self.hcdf_path(sha).exists()
+        if let Some(entry) = self.manifest.get_hcdf(sha) {
+            self.base_dir.join(&entry.path).exists()
+        } else {
+            false
+        }
     }
 
     /// Check if we have a cached model with the given SHA
@@ -427,6 +431,8 @@ mod tests {
         let entry = CachedHcdf {
             url: "https://hcdf.cognipilot.org/spinali/v1.0.hcdf".to_string(),
             sha: "abc123".to_string(),
+            board: "spinali".to_string(),
+            app: "default".to_string(),
             path: "abc123.hcdf".to_string(),
             fetched_at: "2026-01-10T12:00:00Z".to_string(),
             models: HashMap::new(),
