@@ -8,7 +8,7 @@ use bevy_egui::{egui, EguiContexts};
 use bevy_picking::prelude::{Click, Out, Over, Pointer, PointerButton};
 
 use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, SelectedDevice, ShowRotationAxis, WorldSettings};
-use crate::models::{ExcludeFromBounds, PortEntity, SensorAxisEntity, SensorFovEntity};
+use crate::models::{ExcludeFromBounds, PortEntity, PortMeshTarget, SensorAxisEntity, SensorFovEntity};
 use crate::network::HeartbeatState;
 
 pub struct ScenePlugin;
@@ -1689,14 +1689,24 @@ fn render_sensor_fov_tooltip(
 fn on_port_over(
     trigger: On<Pointer<Over>>,
     port_query: Query<&PortEntity>,
+    port_mesh_query: Query<&PortMeshTarget>,
     mut frame_visibility: ResMut<FrameVisibility>,
 ) {
     let entity = trigger.event().entity;
 
+    // Check PortEntity (fallback geometry)
     if let Ok(port) = port_query.get(entity) {
         let port_key = format!("{}:{}", port.device_id, port.port_name);
         frame_visibility.hovered_port = Some(port_key);
-        frame_visibility.hovered_port_from_ui = false; // Mark as 3D hover
+        frame_visibility.hovered_port_from_ui = false;
+        return;
+    }
+
+    // Check PortMeshTarget (GLTF mesh-based ports)
+    if let Ok(port_mesh) = port_mesh_query.get(entity) {
+        let port_key = format!("{}:{}", port_mesh.device_id, port_mesh.port_name);
+        frame_visibility.hovered_port = Some(port_key);
+        frame_visibility.hovered_port_from_ui = false;
     }
 }
 
@@ -1704,12 +1714,14 @@ fn on_port_over(
 fn on_port_out(
     trigger: On<Pointer<Out>>,
     port_query: Query<&PortEntity>,
+    port_mesh_query: Query<&PortMeshTarget>,
     mut frame_visibility: ResMut<FrameVisibility>,
 ) {
     let entity = trigger.event().entity;
 
     // Only clear if this is a port entity AND hover wasn't set by UI
-    if port_query.get(entity).is_ok() && !frame_visibility.hovered_port_from_ui {
+    let is_port = port_query.get(entity).is_ok() || port_mesh_query.get(entity).is_ok();
+    if is_port && !frame_visibility.hovered_port_from_ui {
         frame_visibility.hovered_port = None;
     }
 }
@@ -1719,21 +1731,35 @@ fn render_port_tooltip(
     mut contexts: EguiContexts,
     frame_visibility: Res<FrameVisibility>,
     port_query: Query<&PortEntity>,
+    port_mesh_query: Query<&PortMeshTarget>,
 ) {
     let Some(ref hovered_key) = frame_visibility.hovered_port else {
         return;
     };
 
-    // Find the port entity with matching key
+    // Find the port entity with matching key (check both PortEntity and PortMeshTarget)
     let mut port_name = String::new();
     let mut port_type = String::new();
 
+    // Check PortEntity (fallback geometry)
     for port in port_query.iter() {
         let key = format!("{}:{}", port.device_id, port.port_name);
         if &key == hovered_key {
             port_name = port.port_name.clone();
             port_type = port.port_type.clone();
             break;
+        }
+    }
+
+    // Check PortMeshTarget (GLTF mesh-based ports) if not found
+    if port_name.is_empty() {
+        for port_mesh in port_mesh_query.iter() {
+            let key = format!("{}:{}", port_mesh.device_id, port_mesh.port_name);
+            if &key == hovered_key {
+                port_name = port_mesh.port_name.clone();
+                port_type = port_mesh.port_type.clone();
+                break;
+            }
         }
     }
 

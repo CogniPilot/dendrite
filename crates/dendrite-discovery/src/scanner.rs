@@ -244,6 +244,52 @@ impl DiscoveryScanner {
                 device.parent_id = Some(DeviceId::from_hwid(&parent.name));
             }
 
+            // Check for IP address conflicts - find any existing device with same IP
+            let device_ip = device.discovery.ip;
+            let conflicting_id = devices.iter()
+                .find(|(id, d)| d.discovery.ip == device_ip && *id != &device.id.0)
+                .map(|(id, _)| id.clone());
+
+            if let Some(old_id) = conflicting_id {
+                let new_has_real_id = !device.id.0.starts_with("temp-");
+                let old_has_temp_id = old_id.starts_with("temp-");
+
+                if new_has_real_id && old_has_temp_id {
+                    // New device has real hwid, old had temp - remove old entry
+                    debug!(
+                        old_id = %old_id,
+                        new_id = %device.id,
+                        ip = %device_ip,
+                        "Replacing temp device ID with real hardware ID"
+                    );
+                    devices.remove(&old_id);
+                    let _ = self.event_tx.send(DiscoveryEvent::DeviceOffline(DeviceId::from_hwid(&old_id)));
+                } else if !new_has_real_id && !old_has_temp_id {
+                    // New device has temp ID but old has real ID - skip the temp one
+                    debug!(
+                        old_id = %old_id,
+                        temp_id = %device.id,
+                        ip = %device_ip,
+                        "Ignoring temp ID, device already registered with real hardware ID"
+                    );
+                    // Update the existing device instead
+                    if let Some(existing) = devices.get_mut(&old_id) {
+                        existing.status = DeviceStatus::Online;
+                        let _ = self.event_tx.send(DiscoveryEvent::DeviceUpdated(existing.clone()));
+                        discovered.push(existing.clone());
+                    }
+                    continue;
+                } else if new_has_real_id && !old_has_temp_id && device.id.0 != old_id {
+                    // Both have real IDs but different - IP conflict warning
+                    tracing::warn!(
+                        old_id = %old_id,
+                        new_id = %device.id,
+                        ip = %device_ip,
+                        "IP address conflict: two different devices claim same IP"
+                    );
+                }
+            }
+
             // Check if new or updated
             let is_new = !devices.contains_key(&device.id.0);
             devices.insert(device.id.0.clone(), device.clone());
