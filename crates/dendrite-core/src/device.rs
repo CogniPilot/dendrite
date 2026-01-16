@@ -1,5 +1,6 @@
 //! Device types for tracking discovered hardware
 
+use crate::firmware::FirmwareStatus;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -63,8 +64,10 @@ pub struct FirmwareInfo {
     pub name: Option<String>,
     /// Version string (semver)
     pub version: Option<String>,
-    /// SHA256 hash of the firmware image
-    pub hash: Option<String>,
+    /// Build date of the firmware
+    pub build_date: Option<DateTime<Utc>>,
+    /// SHA256 hash of the firmware image (for post-update verification)
+    pub image_hash: Option<String>,
     /// Whether this image is confirmed (permanent)
     pub confirmed: bool,
     /// Whether this image is pending test
@@ -297,6 +300,14 @@ pub struct Device {
     pub info: DeviceInfo,
     /// Firmware information
     pub firmware: FirmwareInfo,
+    /// Firmware update status (up-to-date, update available, etc.)
+    #[serde(default)]
+    pub firmware_status: FirmwareStatus,
+    /// URI for firmware manifest (from HCDF software element)
+    /// e.g., "https://firmware.cognipilot.org/mr_mcxn_t1/optical-flow"
+    /// The daemon appends "/latest.json" to fetch the manifest.
+    #[serde(default)]
+    pub firmware_manifest_uri: Option<String>,
     /// Parent device ID (for topology)
     pub parent_id: Option<DeviceId>,
     /// Path to 3D model file (glTF/GLB) - legacy, prefer visuals
@@ -336,6 +347,8 @@ impl Device {
             },
             info: DeviceInfo::default(),
             firmware: FirmwareInfo::default(),
+            firmware_status: FirmwareStatus::default(),
+            firmware_manifest_uri: None,
             parent_id: None,
             model_path: None,
             pose: None,

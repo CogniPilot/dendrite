@@ -4,7 +4,7 @@
 //! extending URDF concepts for CogniPilot systems.
 
 use quick_xml::de::from_str;
-use quick_xml::se::to_string;
+use quick_xml::se::Serializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -63,11 +63,16 @@ impl Pose {
 pub struct Software {
     #[serde(rename = "@name", default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(default)]
+    /// URI for firmware manifest (e.g., "https://firmware.cognipilot.org/mr_mcxn_t1/optical-flow")
+    /// The daemon appends "/latest.json" to fetch the manifest.
+    /// Required for firmware update checking - no default fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_manifest_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<String>,
 }
 
@@ -75,9 +80,9 @@ pub struct Software {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Discovered {
     pub ip: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
 }
 
@@ -86,25 +91,25 @@ pub struct Discovered {
 pub struct NetworkInterface {
     #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename = "@type", default)]
+    #[serde(rename = "@type", default, skip_serializing_if = "Option::is_none")]
     pub interface_type: Option<String>,
-    #[serde(rename = "@ports", default)]
+    #[serde(rename = "@ports", default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch: Option<SwitchInfo>,
 }
 
 /// Network switch information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwitchInfo {
-    #[serde(rename = "@chip", default)]
+    #[serde(rename = "@chip", default, skip_serializing_if = "Option::is_none")]
     pub chip: Option<String>,
 }
 
 /// Network configuration for a device
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Network {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interface: Vec<NetworkInterface>,
 }
 
@@ -113,30 +118,30 @@ pub struct Network {
 pub struct Mcu {
     #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename = "@hwid", default)]
+    #[serde(rename = "@hwid", default, skip_serializing_if = "Option::is_none")]
     pub hwid: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose_cg: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mass: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software: Option<Software>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovered: Option<Discovered>,
     /// Legacy single model reference (deprecated, use visuals instead)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     /// Multiple visual elements with individual poses
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visual: Vec<Visual>,
     /// Reference frames for this component
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame: Vec<Frame>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
 }
 
@@ -145,41 +150,41 @@ pub struct Mcu {
 pub struct Comp {
     #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename = "@role", default)]
+    #[serde(rename = "@role", default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(rename = "@hwid", default)]
+    #[serde(rename = "@hwid", default, skip_serializing_if = "Option::is_none")]
     pub hwid: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose_cg: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mass: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software: Option<Software>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovered: Option<Discovered>,
     /// Legacy single model reference (deprecated, use visuals instead)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     /// Multiple visual elements with individual poses
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visual: Vec<Visual>,
     /// Reference frames for this component
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame: Vec<Frame>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
     /// Ports (wired connection interfaces)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port: Vec<Port>,
     /// Antennas (wireless connection interfaces)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub antenna: Vec<Antenna>,
     /// Sensors
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sensor: Vec<Sensor>,
 }
 
@@ -189,7 +194,7 @@ pub struct ModelRef {
     #[serde(rename = "@href")]
     pub href: String,
     /// SHA256 hash of the model file for cache validation
-    #[serde(rename = "@sha", default)]
+    #[serde(rename = "@sha", default, skip_serializing_if = "Option::is_none")]
     pub sha: Option<String>,
 }
 
@@ -199,13 +204,13 @@ pub struct Visual {
     #[serde(rename = "@name")]
     pub name: String,
     /// Toggle group name for visibility control (e.g., "case")
-    #[serde(rename = "@toggle", default)]
+    #[serde(rename = "@toggle", default, skip_serializing_if = "Option::is_none")]
     pub toggle: Option<String>,
     /// Pose offset: "x y z roll pitch yaw" (meters, radians)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose: Option<String>,
     /// Reference to 3D model
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
 }
 
@@ -222,10 +227,10 @@ pub struct Frame {
     #[serde(rename = "@name")]
     pub name: String,
     /// Human-readable description of this frame
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Pose offset: "x y z roll pitch yaw" (meters, radians)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose: Option<String>,
 }
 
@@ -844,10 +849,14 @@ impl Hcdf {
         Self::from_xml(&content)
     }
 
-    /// Serialize to XML string
+    /// Serialize to XML string with proper indentation for readability
     pub fn to_xml(&self) -> Result<String, HcdfError> {
-        let xml = to_string(self).map_err(|e| HcdfError::SerializeError(e.to_string()))?;
-        Ok(format!("<?xml version='1.0'?>\n{}", xml))
+        let mut buffer = String::new();
+        let mut ser = Serializer::new(&mut buffer);
+        ser.indent(' ', 2);
+        self.serialize(ser)
+            .map_err(|e| HcdfError::SerializeError(e.to_string()))?;
+        Ok(format!("<?xml version='1.0'?>\n{}", buffer))
     }
 
     /// Write to file
@@ -882,13 +891,17 @@ impl Hcdf {
                 let sw = mcu.software.get_or_insert(Software::default());
                 sw.name = name.clone();
                 sw.version = device.firmware.version.clone();
-                sw.hash = device.firmware.hash.clone();
+                sw.hash = device.firmware.image_hash.clone();
             }
             mcu.discovered = Some(Discovered {
                 ip: device.discovery.ip.to_string(),
                 port: device.discovery.switch_port,
                 last_seen: Some(device.discovery.last_seen.to_rfc3339()),
             });
+            // Update pose_cg from device pose (preserves position edits)
+            if let Some(pose) = device.pose {
+                mcu.pose_cg = Some(format!("{} {} {} {} {} {}", pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]));
+            }
         } else {
             // Create new MCU
             let mcu = Mcu {
@@ -903,7 +916,8 @@ impl Hcdf {
                 software: device.firmware.name.as_ref().map(|name| Software {
                     name: name.clone(),
                     version: device.firmware.version.clone(),
-                    hash: device.firmware.hash.clone(),
+                    firmware_manifest_uri: device.firmware_manifest_uri.clone(),
+                    hash: device.firmware.image_hash.clone(),
                     params: None,
                 }),
                 discovered: Some(Discovered {
