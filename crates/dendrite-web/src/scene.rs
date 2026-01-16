@@ -1,13 +1,14 @@
 //! 3D scene management
 
 use bevy::prelude::*;
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::render::alpha::AlphaMode;
 use bevy::camera::primitives::MeshAabb;  // Trait for compute_aabb
 use bevy_egui::{egui, EguiContexts};
 use bevy_picking::prelude::{Click, Out, Over, Pointer, PointerButton};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, SelectedDevice, ShowRotationAxis, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FirmwareCheckState, FirmwareStatusData, FrameVisibility, SelectedDevice, ShowRotationAxis, WorldSettings};
 use crate::models::{ExcludeFromBounds, PortEntity, PortMeshTarget, SensorAxisEntity, SensorFovEntity};
 use crate::network::HeartbeatState;
 
@@ -494,39 +495,44 @@ fn update_device_orientations(
     }
 }
 
+/// Grouped system parameters for the selection highlight system to work around Bevy's 16-param limit
+#[derive(SystemParam)]
+pub struct SelectionHighlightParams<'w, 's> {
+    pub commands: Commands<'w, 's>,
+    pub selected: Res<'w, SelectedDevice>,
+    pub active_rotation_field: Res<'w, ActiveRotationField>,
+    pub show_rotation_axis: Res<'w, ShowRotationAxis>,
+    pub registry: Res<'w, DeviceRegistry>,
+    pub heartbeat_state: Res<'w, HeartbeatState>,
+    pub firmware_state: Res<'w, FirmwareCheckState>,
+    pub device_query: Query<'w, 's, (Entity, &'static DeviceEntity, &'static Transform), (Without<SelectionHighlight>, Without<RotationAxisIndicator>)>,
+    pub highlight_query: Query<'w, 's, (Entity, &'static mut SelectionHighlight, &'static MeshMaterial3d<StandardMaterial>)>,
+    pub axis_query: Query<'w, 's, (Entity, &'static RotationAxisIndicator, &'static MeshMaterial3d<StandardMaterial>)>,
+    pub highlight_transform_query: Query<'w, 's, &'static mut Transform, With<SelectionHighlight>>,
+    pub axis_transform_query: Query<'w, 's, &'static mut Transform, (With<RotationAxisIndicator>, Without<SelectionHighlight>)>,
+    pub children_query: Query<'w, 's, &'static Children>,
+    pub mesh_query: Query<'w, 's, (&'static Mesh3d, &'static GlobalTransform)>,
+    pub exclude_query: Query<'w, 's, Entity, With<ExcludeFromBounds>>,
+    pub meshes: ResMut<'w, Assets<Mesh>>,
+    pub materials: ResMut<'w, Assets<StandardMaterial>>,
+}
+
 /// Update selection highlight - show bounding box and rotation axes
-fn update_selection_highlight(
-    mut commands: Commands,
-    selected: Res<SelectedDevice>,
-    active_rotation_field: Res<ActiveRotationField>,
-    show_rotation_axis: Res<ShowRotationAxis>,
-    registry: Res<crate::app::DeviceRegistry>,
-    heartbeat_state: Res<HeartbeatState>,
-    device_query: Query<(Entity, &DeviceEntity, &Transform), (Without<SelectionHighlight>, Without<RotationAxisIndicator>)>,
-    mut highlight_query: Query<(Entity, &mut SelectionHighlight, &MeshMaterial3d<StandardMaterial>)>,
-    axis_query: Query<(Entity, &RotationAxisIndicator, &MeshMaterial3d<StandardMaterial>)>,
-    mut highlight_transform_query: Query<&mut Transform, With<SelectionHighlight>>,
-    mut axis_transform_query: Query<&mut Transform, (With<RotationAxisIndicator>, Without<SelectionHighlight>)>,
-    children_query: Query<&Children>,
-    mesh_query: Query<(&Mesh3d, &GlobalTransform)>,
-    exclude_query: Query<Entity, With<ExcludeFromBounds>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+fn update_selection_highlight(mut params: SelectionHighlightParams) {
     // Get currently selected device ID
-    let selected_id = selected.0.as_ref();
+    let selected_id = params.selected.0.as_ref();
 
     // Remove highlights for devices that are no longer selected
-    for (entity, highlight, _) in highlight_query.iter_mut() {
+    for (entity, highlight, _) in params.highlight_query.iter_mut() {
         if selected_id != Some(&highlight.target_device) {
-            commands.entity(entity).despawn();
+            params.commands.entity(entity).despawn();
         }
     }
 
     // Remove axis indicators for devices that are no longer selected OR when checkbox is unchecked
-    for (entity, axis, _) in axis_query.iter() {
-        if selected_id != Some(&axis.target_device) || !show_rotation_axis.0 {
-            commands.entity(entity).despawn();
+    for (entity, axis, _) in params.axis_query.iter() {
+        if selected_id != Some(&axis.target_device) || !params.show_rotation_axis.0 {
+            params.commands.entity(entity).despawn();
         }
     }
 
@@ -536,20 +542,20 @@ fn update_selection_highlight(
     };
 
     // Check if highlight already exists
-    let highlight_exists = highlight_query.iter_mut().any(|(_, h, _)| &h.target_device == selected_id);
+    let highlight_exists = params.highlight_query.iter_mut().any(|(_, h, _)| &h.target_device == selected_id);
 
     // Check if axis indicators exist (separate from highlight)
-    let axis_exists = axis_query.iter().any(|(_, a, _)| &a.target_device == selected_id);
+    let axis_exists = params.axis_query.iter().any(|(_, a, _)| &a.target_device == selected_id);
 
     // Get device status from registry
-    let device_is_online = registry.devices.iter()
+    let device_is_online = params.registry.devices.iter()
         .find(|d| &d.id == selected_id)
         .map(|d| d.status == crate::app::DeviceStatus::Online)
         .unwrap_or(false);
 
     // Find the selected device position
     let mut selected_device_pos = None;
-    for (entity, device, transform) in device_query.iter() {
+    for (entity, device, transform) in params.device_query.iter() {
         if &device.device_id == selected_id {
             selected_device_pos = Some((entity, transform.translation, transform.clone()));
             break;
@@ -563,15 +569,15 @@ fn update_selection_highlight(
     // Update existing highlight positions, rotations, and colors
     if highlight_exists {
         // Find device transform
-        for (_, device, transform) in device_query.iter() {
+        for (_, device, transform) in params.device_query.iter() {
             if &device.device_id == selected_id {
                 let device_pos = transform.translation;
                 let device_rotation = transform.rotation;
 
                 // Update highlight box edges to rotate with device and update colors
-                for (highlight_entity, mut highlight, material_handle) in highlight_query.iter_mut() {
+                for (highlight_entity, mut highlight, material_handle) in params.highlight_query.iter_mut() {
                     if &highlight.target_device == selected_id {
-                        if let Ok(mut highlight_transform) = highlight_transform_query.get_mut(highlight_entity) {
+                        if let Ok(mut highlight_transform) = params.highlight_transform_query.get_mut(highlight_entity) {
                             // Rotate the offset by the device rotation, then add to position
                             let rotated_offset = device_rotation * highlight.offset;
                             highlight_transform.translation = device_pos + rotated_offset;
@@ -583,14 +589,25 @@ fn update_selection_highlight(
                         if should_update {
                             highlight.is_online = device_is_online; // Update the stored status
                         }
-                        // Always update material to reflect heartbeat state
-                        // Keep offline devices red even when heartbeat is off (they were seen offline)
-                        if let Some(material) = materials.get_mut(&material_handle.0) {
+                        // Always update material to reflect heartbeat/firmware state
+                        // Priority: Offline (red) > Firmware outdated (yellow) > Online (green/white)
+                        if let Some(material) = params.materials.get_mut(&material_handle.0) {
+                            // Check if firmware is outdated (only when firmware checking is enabled)
+                            let is_firmware_outdated = params.firmware_state.enabled
+                                && matches!(
+                                    params.firmware_state.device_status.get(selected_id),
+                                    Some(FirmwareStatusData::UpdateAvailable { .. })
+                                );
+
                             if !device_is_online {
                                 // Device is offline - always show red regardless of heartbeat state
                                 material.base_color = Color::srgba(0.6, 0.1, 0.1, 0.5);
                                 material.emissive = bevy::color::LinearRgba::new(0.3, 0.05, 0.05, 1.0);
-                            } else if !heartbeat_state.enabled {
+                            } else if is_firmware_outdated {
+                                // Device has outdated firmware - show yellow
+                                material.base_color = Color::srgba(0.8, 0.7, 0.2, 0.5);
+                                material.emissive = bevy::color::LinearRgba::new(0.4, 0.35, 0.1, 1.0);
+                            } else if !params.heartbeat_state.enabled {
                                 // Device is online but heartbeat is off - show white (status unknown)
                                 material.base_color = Color::srgba(0.8, 0.8, 0.8, 0.5);
                                 material.emissive = bevy::color::LinearRgba::new(0.2, 0.2, 0.2, 1.0);
@@ -613,7 +630,7 @@ fn update_selection_highlight(
         let mut found_mesh = false;
 
         // Collect entities to skip (visualization entities that shouldn't affect bounding box)
-        let skip_entities: std::collections::HashSet<Entity> = exclude_query.iter().collect();
+        let skip_entities: std::collections::HashSet<Entity> = params.exclude_query.iter().collect();
 
         // Recursively find all mesh children and compute bounds in device-local space
         fn collect_bounds(
@@ -677,7 +694,7 @@ fn update_selection_highlight(
 
         // Get inverse of device rotation for converting world -> device-local
         let device_rotation_inv = device_transform.rotation.inverse();
-        collect_bounds(entity, &children_query, &mesh_query, meshes.as_ref(), device_pos, device_rotation_inv, &mut min, &mut max, &mut found_mesh, &skip_entities);
+        collect_bounds(entity, &params.children_query, &params.mesh_query, params.meshes.as_ref(), device_pos, device_rotation_inv, &mut min, &mut max, &mut found_mesh, &skip_entities);
 
         // Use default size if no mesh bounds found
         let (box_min, box_max) = if found_mesh {
@@ -699,13 +716,22 @@ fn update_selection_highlight(
         // Store half for axis length calculation (used later)
         let half = box_size / 2.0;
 
-        // Color based on device status and heartbeat state
-        // Offline devices always show red (they were seen offline)
-        // Online devices show white when heartbeat is off (status unknown), green when on
+        // Color based on device status, firmware status, and heartbeat state
+        // Priority: Offline (red) > Firmware outdated (yellow) > Online (green/white)
+        // Check if firmware is outdated (only when firmware checking is enabled)
+        let is_firmware_outdated = params.firmware_state.enabled
+            && matches!(
+                params.firmware_state.device_status.get(selected_id),
+                Some(FirmwareStatusData::UpdateAvailable { .. })
+            );
+
         let (base_color, emissive) = if !device_is_online {
             // Device is offline - always show red regardless of heartbeat state
             (Color::srgba(0.6, 0.1, 0.1, 0.5), bevy::color::LinearRgba::new(0.3, 0.05, 0.05, 1.0))
-        } else if !heartbeat_state.enabled {
+        } else if is_firmware_outdated {
+            // Device has outdated firmware - show yellow
+            (Color::srgba(0.8, 0.7, 0.2, 0.5), bevy::color::LinearRgba::new(0.4, 0.35, 0.1, 1.0))
+        } else if !params.heartbeat_state.enabled {
             // Device is online but heartbeat is off - show white (status unknown)
             (Color::srgba(0.8, 0.8, 0.8, 0.5), bevy::color::LinearRgba::new(0.2, 0.2, 0.2, 1.0))
         } else {
@@ -713,7 +739,7 @@ fn update_selection_highlight(
             (Color::srgba(0.3, 0.8, 0.3, 0.5), bevy::color::LinearRgba::new(0.15, 0.4, 0.15, 1.0))
         };
 
-        let highlight_material = materials.add(StandardMaterial {
+        let highlight_material = params.materials.add(StandardMaterial {
             base_color,
             emissive,
             unlit: true,
@@ -762,8 +788,8 @@ fn update_selection_highlight(
         ];
 
         for (offset, size) in edges {
-            commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            params.commands.spawn((
+                Mesh3d(params.meshes.add(Cuboid::new(size.x, size.y, size.z))),
                 MeshMaterial3d(highlight_material.clone()),
                 Transform::from_translation(device_pos + offset),
                 SelectionHighlight {
@@ -778,7 +804,7 @@ fn update_selection_highlight(
 
     // Create rotation axis indicators only if checkbox is checked AND they don't exist yet
     // This block runs independently of highlight creation so toggling the checkbox works
-    if show_rotation_axis.0 && !axis_exists {
+    if params.show_rotation_axis.0 && !axis_exists {
         // (FLU: Forward=X/Red, Left=Y/Green, Up=Z/Blue)
         // Use a default axis length (can be adjusted based on typical device sizes)
         let axis_length = 0.06; // 6cm default axis length
@@ -795,7 +821,7 @@ fn update_selection_highlight(
         let shaft_rotation = device_transform.rotation;
 
         // X axis (Roll/Forward - Red)
-        let x_axis_material = materials.add(StandardMaterial {
+        let x_axis_material = params.materials.add(StandardMaterial {
             base_color: Color::srgb(0.5, 0.1, 0.1),
             emissive: bevy::color::LinearRgba::new(0.5, 0.1, 0.1, 1.0),
             unlit: false,
@@ -803,8 +829,8 @@ fn update_selection_highlight(
             ..default()
         });
         let x_shaft_center = device_pos + body_x * (axis_length / 2.0);
-        commands.spawn((
-            Mesh3d(meshes.add(Cylinder::new(axis_thickness, axis_length))),
+        params.commands.spawn((
+            Mesh3d(params.meshes.add(Cylinder::new(axis_thickness, axis_length))),
             MeshMaterial3d(x_axis_material.clone()),
             Transform::from_translation(x_shaft_center)
                 .with_rotation(shaft_rotation),
@@ -816,8 +842,8 @@ fn update_selection_highlight(
         ));
         let x_cone_center = device_pos + body_x * (axis_length + cone_height / 2.0);
         let x_cone_rotation = shaft_rotation * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
-        commands.spawn((
-            Mesh3d(meshes.add(Cone::new(cone_radius, cone_height))),
+        params.commands.spawn((
+            Mesh3d(params.meshes.add(Cone::new(cone_radius, cone_height))),
             MeshMaterial3d(x_axis_material),
             Transform::from_translation(x_cone_center)
                 .with_rotation(x_cone_rotation),
@@ -829,7 +855,7 @@ fn update_selection_highlight(
         ));
 
         // Y axis (Pitch/Left - Green)
-        let y_axis_material = materials.add(StandardMaterial {
+        let y_axis_material = params.materials.add(StandardMaterial {
             base_color: Color::srgb(0.1, 0.5, 0.1),
             emissive: bevy::color::LinearRgba::new(0.1, 0.5, 0.1, 1.0),
             unlit: false,
@@ -837,8 +863,8 @@ fn update_selection_highlight(
             ..default()
         });
         let y_shaft_center = device_pos + body_y * (axis_length / 2.0);
-        commands.spawn((
-            Mesh3d(meshes.add(Cylinder::new(axis_thickness, axis_length))),
+        params.commands.spawn((
+            Mesh3d(params.meshes.add(Cylinder::new(axis_thickness, axis_length))),
             MeshMaterial3d(y_axis_material.clone()),
             Transform::from_translation(y_shaft_center)
                 .with_rotation(shaft_rotation),
@@ -850,8 +876,8 @@ fn update_selection_highlight(
         ));
         let y_cone_center = device_pos + body_y * (axis_length + cone_height / 2.0);
         let y_cone_rotation = shaft_rotation;
-        commands.spawn((
-            Mesh3d(meshes.add(Cone::new(cone_radius, cone_height))),
+        params.commands.spawn((
+            Mesh3d(params.meshes.add(Cone::new(cone_radius, cone_height))),
             MeshMaterial3d(y_axis_material),
             Transform::from_translation(y_cone_center)
                 .with_rotation(y_cone_rotation),
@@ -863,7 +889,7 @@ fn update_selection_highlight(
         ));
 
         // Z axis (Yaw/Up - Blue)
-        let z_axis_material = materials.add(StandardMaterial {
+        let z_axis_material = params.materials.add(StandardMaterial {
             base_color: Color::srgb(0.1, 0.1, 0.5),
             emissive: bevy::color::LinearRgba::new(0.1, 0.1, 0.5, 1.0),
             unlit: false,
@@ -871,8 +897,8 @@ fn update_selection_highlight(
             ..default()
         });
         let z_shaft_center = device_pos + body_z * (axis_length / 2.0);
-        commands.spawn((
-            Mesh3d(meshes.add(Cylinder::new(axis_thickness, axis_length))),
+        params.commands.spawn((
+            Mesh3d(params.meshes.add(Cylinder::new(axis_thickness, axis_length))),
             MeshMaterial3d(z_axis_material.clone()),
             Transform::from_translation(z_shaft_center)
                 .with_rotation(shaft_rotation),
@@ -884,8 +910,8 @@ fn update_selection_highlight(
         ));
         let z_cone_center = device_pos + body_z * (axis_length + cone_height / 2.0);
         let z_cone_rotation = shaft_rotation * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-        commands.spawn((
-            Mesh3d(meshes.add(Cone::new(cone_radius, cone_height))),
+        params.commands.spawn((
+            Mesh3d(params.meshes.add(Cone::new(cone_radius, cone_height))),
             MeshMaterial3d(z_axis_material),
             Transform::from_translation(z_cone_center)
                 .with_rotation(z_cone_rotation),
@@ -900,17 +926,17 @@ fn update_selection_highlight(
     // Update existing axis indicator positions and rotations to follow the device
     if axis_exists {
         // Find device transform
-        for (_, device, transform) in device_query.iter() {
+        for (_, device, transform) in params.device_query.iter() {
             if &device.device_id == selected_id {
                 let device_pos = transform.translation;
                 let device_rotation = transform.rotation;
 
                 // Update all axis indicators
                 // All use device_rotation as base, cones have additional local rotation
-                for (axis_entity, axis, material_handle) in axis_query.iter() {
+                for (axis_entity, axis, material_handle) in params.axis_query.iter() {
                     if &axis.target_device == selected_id {
                         // Update position and rotation (no scaling)
-                        if let Ok(mut axis_transform) = axis_transform_query.get_mut(axis_entity) {
+                        if let Ok(mut axis_transform) = params.axis_transform_query.get_mut(axis_entity) {
                             // Position: rotate the stored offset by device rotation
                             let rotated_offset = device_rotation * axis.offset;
                             axis_transform.translation = device_pos + rotated_offset;
@@ -945,8 +971,8 @@ fn update_selection_highlight(
                         }
 
                         // Update material based on active rotation field
-                        if let Some(material) = materials.get_mut(&material_handle.0) {
-                            let is_active = match active_rotation_field.axis {
+                        if let Some(material) = params.materials.get_mut(&material_handle.0) {
+                            let is_active = match params.active_rotation_field.axis {
                                 ActiveRotationAxis::Roll => axis.axis == ActiveRotationAxis::Roll,
                                 ActiveRotationAxis::Pitch => axis.axis == ActiveRotationAxis::Pitch,
                                 ActiveRotationAxis::Yaw => axis.axis == ActiveRotationAxis::Yaw,
@@ -960,7 +986,7 @@ fn update_selection_highlight(
                                     if is_active {
                                         // Brighter red when active - moderate emissive
                                         (Color::srgba(0.6, 0.15, 0.15, 1.0), bevy::color::LinearRgba::new(1.2, 0.3, 0.3, 1.0), false)
-                                    } else if active_rotation_field.axis != ActiveRotationAxis::None {
+                                    } else if params.active_rotation_field.axis != ActiveRotationAxis::None {
                                         // Dimmed red when another axis is active (50% transparency)
                                         (Color::srgba(0.4, 0.1, 0.1, 0.5), bevy::color::LinearRgba::new(0.0, 0.0, 0.0, 1.0), true)
                                     } else {
@@ -972,7 +998,7 @@ fn update_selection_highlight(
                                     if is_active {
                                         // Brighter green when active - moderate emissive
                                         (Color::srgba(0.15, 0.6, 0.15, 1.0), bevy::color::LinearRgba::new(0.3, 1.2, 0.3, 1.0), false)
-                                    } else if active_rotation_field.axis != ActiveRotationAxis::None {
+                                    } else if params.active_rotation_field.axis != ActiveRotationAxis::None {
                                         // Dimmed green when another axis is active (50% transparency)
                                         (Color::srgba(0.1, 0.4, 0.1, 0.5), bevy::color::LinearRgba::new(0.0, 0.0, 0.0, 1.0), true)
                                     } else {
@@ -984,7 +1010,7 @@ fn update_selection_highlight(
                                     if is_active {
                                         // Brighter blue when active - moderate emissive
                                         (Color::srgba(0.15, 0.15, 0.6, 1.0), bevy::color::LinearRgba::new(0.3, 0.3, 1.2, 1.0), false)
-                                    } else if active_rotation_field.axis != ActiveRotationAxis::None {
+                                    } else if params.active_rotation_field.axis != ActiveRotationAxis::None {
                                         // Dimmed blue when another axis is active (50% transparency)
                                         (Color::srgba(0.1, 0.1, 0.4, 0.5), bevy::color::LinearRgba::new(0.0, 0.0, 0.0, 1.0), true)
                                     } else {

@@ -3,6 +3,7 @@
 //! This crate provides the browser-based visualization using Bevy and WebGPU.
 
 mod app;
+pub mod file_picker;
 mod models;
 mod network;
 mod scene;

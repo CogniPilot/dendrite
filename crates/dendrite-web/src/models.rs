@@ -222,10 +222,11 @@ fn sync_device_entities(
     mut model_cache: ResMut<ModelCache>,
     asset_server: Res<AssetServer>,
     existing_devices: Query<(Entity, &DeviceEntity)>,
+    mut transform_query: Query<&mut Transform, With<DeviceEntity>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Collect existing device IDs
+    // Collect existing device IDs and entities
     let existing_ids: HashMap<String, Entity> = existing_devices
         .iter()
         .map(|(e, d)| (d.device_id.clone(), e))
@@ -248,20 +249,52 @@ fn sync_device_entities(
     // Add or update devices
     // ENU coordinate system: X=East, Y=North, Z=Up
     for device in &registry.devices {
+        // Check if entity already exists
+        if let Some(&entity) = existing_ids.get(&device.id) {
+            // Entity exists - update position and orientation if registry has explicit values
+            if let Ok(mut transform) = transform_query.get_mut(entity) {
+                // Update position if explicit position from HCDF import
+                if let Some(pos) = device.position {
+                    let new_pos = Vec3::new(pos[0] as f32, pos[1] as f32, pos[2] as f32);
+                    if (transform.translation - new_pos).length() > 0.001 {
+                        tracing::info!(
+                            "Updating device {} position from {:?} to {:?}",
+                            device.id, transform.translation, new_pos
+                        );
+                        transform.translation = new_pos;
+                    }
+                }
+                // Update rotation if explicit orientation from HCDF import
+                if let Some(orient) = device.orientation {
+                    let new_rotation = Quat::from_euler(
+                        EulerRot::ZYX,
+                        orient[2] as f32, // yaw (Z)
+                        orient[1] as f32, // pitch (Y)
+                        orient[0] as f32, // roll (X)
+                    );
+                    // Only update if rotation changed significantly
+                    if transform.rotation.angle_between(new_rotation) > 0.001 {
+                        tracing::info!(
+                            "Updating device {} rotation to roll={:.3}, pitch={:.3}, yaw={:.3}",
+                            device.id, orient[0], orient[1], orient[2]
+                        );
+                        transform.rotation = new_rotation;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Entity doesn't exist - calculate position for spawning
         let position = device
             .position
-            .map(|p| Vec3::new(p[0] as f32, p[1] as f32, 0.01)) // ENU: X, Y on ground, Z slightly above
+            .map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
             .unwrap_or_else(|| {
                 // Auto-arrange in circle on X-Y plane if no position
                 let idx = registry.devices.iter().position(|d| d.id == device.id).unwrap_or(0);
                 let angle = (idx as f32) * std::f32::consts::TAU / registry.devices.len().max(1) as f32;
                 Vec3::new(0.15 * angle.cos(), 0.15 * angle.sin(), 0.01) // ENU: X-Y plane, Z=0.01
             });
-
-        if existing_ids.contains_key(&device.id) {
-            // Already spawned
-            continue;
-        }
 
         // Spawn new device entity
         let color = match device.status {

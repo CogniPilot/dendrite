@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use crate::app::{AxisAlignData, DeviceData, DeviceRegistry, DeviceStatus, FovData, FrameData, GeometryData, PortData, SensorData, VisualData};
+use crate::app::{AxisAlignData, DeviceData, DeviceRegistry, DeviceStatus, FirmwareCheckState, FirmwareStatusData, FovData, FrameData, GeometryData, PortData, SensorData, VisualData};
 
 pub struct NetworkPlugin;
 
@@ -134,6 +134,50 @@ struct UpdateSubnetRequest {
     prefix_len: u8,
 }
 
+/// Pending firmware check data from async fetch
+#[derive(Resource, Default)]
+pub struct PendingFirmwareData(pub Arc<Mutex<Vec<FirmwareCheckResponse>>>);
+
+/// Response from firmware check API
+#[derive(Debug, Clone, Deserialize)]
+pub struct FirmwareCheckResponse {
+    pub device_id: String,
+    pub current_version: Option<String>,
+    /// MCUboot image hash from the device (what MCUmgr reports)
+    pub current_mcuboot_hash: Option<String>,
+    pub latest_version: Option<String>,
+    /// MCUboot image hash for the latest release (for verification after OTA)
+    pub latest_mcuboot_hash: Option<String>,
+    pub status: FirmwareStatusJson,
+    pub changelog: Option<String>,
+}
+
+/// Firmware status JSON from backend (matches serde tag format)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FirmwareStatusJson {
+    UpToDate,
+    UpdateAvailable {
+        latest_version: String,
+        changelog: Option<String>,
+    },
+    Unknown,
+    CheckDisabled,
+}
+
+impl From<FirmwareStatusJson> for FirmwareStatusData {
+    fn from(json: FirmwareStatusJson) -> Self {
+        match json {
+            FirmwareStatusJson::UpToDate => FirmwareStatusData::UpToDate,
+            FirmwareStatusJson::UpdateAvailable { latest_version, changelog } => {
+                FirmwareStatusData::UpdateAvailable { latest_version, changelog }
+            }
+            FirmwareStatusJson::Unknown => FirmwareStatusData::Unknown,
+            FirmwareStatusJson::CheckDisabled => FirmwareStatusData::CheckDisabled,
+        }
+    }
+}
+
 impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         // Initialize daemon config from browser URL
@@ -146,9 +190,11 @@ impl Plugin for NetworkPlugin {
             .init_resource::<PendingInterfaceData>()
             .init_resource::<HeartbeatState>()
             .init_resource::<PendingHeartbeatData>()
+            .init_resource::<PendingFirmwareData>()
+            .init_resource::<PendingHcdfExport>()
             .add_message::<ReconnectEvent>()
             .add_systems(Startup, (connect_websocket, fetch_initial_devices, fetch_network_interfaces, fetch_heartbeat_state))
-            .add_systems(Update, (process_messages, process_interface_data, process_heartbeat_data, handle_reconnect));
+            .add_systems(Update, (process_messages, process_interface_data, process_heartbeat_data, process_firmware_data, handle_reconnect));
     }
 }
 
@@ -339,6 +385,11 @@ pub enum WsMessage {
         #[allow(dead_code)]
         total: usize,
     },
+    #[serde(rename = "ota_progress")]
+    OtaProgress {
+        device_id: String,
+        state: OtaUpdateState,
+    },
     #[serde(rename = "pong")]
     Pong,
 }
@@ -520,6 +571,7 @@ impl From<DeviceJson> for DeviceData {
             },
             version: json.firmware.version,
             position: json.pose.map(|p| [p[0], p[1], p[2]]),
+            orientation: json.pose.map(|p| [p[3], p[4], p[5]]),
             model_path: json.model_path,
             visuals: json.visuals.into_iter().map(|v| VisualData {
                 name: v.name,
@@ -653,6 +705,7 @@ fn process_messages(
     connection: Res<WebSocketConnection>,
     pending: Res<PendingMessages>,
     mut registry: ResMut<DeviceRegistry>,
+    mut ota_state: ResMut<crate::app::OtaState>,
 ) {
     // Process queued messages from the shared queue
     let messages = {
@@ -668,7 +721,11 @@ fn process_messages(
             WsMessage::DeviceDiscovered(device) => {
                 let data: DeviceData = device.into();
                 tracing::info!("Device discovered: {} - {}", data.id, data.name);
-                if !registry.devices.iter().any(|d| d.id == data.id) {
+                // Update existing device if it exists (e.g., after HCDF import with new position)
+                // Otherwise add as new device
+                if let Some(existing) = registry.devices.iter_mut().find(|d| d.id == data.id) {
+                    *existing = data;
+                } else {
                     registry.devices.push(data);
                 }
             }
@@ -685,6 +742,16 @@ fn process_messages(
             }
             WsMessage::DeviceRemoved { id } => {
                 registry.devices.retain(|d| d.id != id);
+            }
+            WsMessage::OtaProgress { device_id, state } => {
+                tracing::info!("OTA progress for {}: {:?}", device_id, state);
+                // Store the state, or remove if terminal
+                if state.is_terminal() {
+                    // Keep terminal states for a while so UI can show completion
+                    ota_state.device_updates.insert(device_id, state);
+                } else {
+                    ota_state.device_updates.insert(device_id, state);
+                }
             }
             _ => {}
         }
@@ -894,5 +961,444 @@ pub fn remove_device(device_id: &str, base_url: &str) {
                 }
             }
         });
+    }
+}
+
+/// Process pending firmware check data
+fn process_firmware_data(
+    pending: Res<PendingFirmwareData>,
+    mut firmware_state: ResMut<FirmwareCheckState>,
+) {
+    if let Ok(mut data) = pending.0.lock() {
+        for response in data.drain(..) {
+            // Convert JSON status to our enum
+            let status: FirmwareStatusData = response.status.into();
+            firmware_state.device_status.insert(response.device_id.clone(), status);
+            firmware_state.loading.remove(&response.device_id);
+        }
+    }
+}
+
+/// Trigger firmware check for all devices (called from UI)
+pub fn check_all_firmware(base_url: &str, pending: &PendingFirmwareData) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let base_url = base_url.to_string();
+        let pending_clone = pending.0.clone();
+
+        spawn_local(async move {
+            let url = format!("{}/api/firmware/check", base_url);
+
+            tracing::info!("Checking firmware for all devices");
+
+            match gloo_net::http::Request::get(&url).send().await {
+                Ok(response) => {
+                    if let Ok(text) = response.text().await {
+                        tracing::debug!("Firmware check response: {}", text);
+                        if let Ok(results) = serde_json::from_str::<Vec<FirmwareCheckResponse>>(&text) {
+                            if let Ok(mut data) = pending_clone.lock() {
+                                data.extend(results);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to check firmware: {:?}", e);
+                }
+            }
+        });
+    }
+}
+
+// ============================================================================
+// OTA Update Functions
+// ============================================================================
+
+/// Pending OTA update events from WebSocket
+#[derive(Resource, Default)]
+pub struct PendingOtaEvents(pub Arc<Mutex<Vec<OtaProgressEvent>>>);
+
+/// OTA progress event from WebSocket
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtaProgressEvent {
+    pub device_id: String,
+    pub state: OtaUpdateState,
+}
+
+/// OTA update state (mirrors backend UpdateState)
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum OtaUpdateState {
+    Downloading { progress: f32 },
+    Uploading { progress: f32 },
+    Confirming,
+    Rebooting,
+    Verifying,
+    Complete,
+    Failed { error: String },
+    Cancelled,
+}
+
+impl OtaUpdateState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, OtaUpdateState::Complete | OtaUpdateState::Failed { .. } | OtaUpdateState::Cancelled)
+    }
+
+    pub fn progress_text(&self) -> String {
+        match self {
+            OtaUpdateState::Downloading { progress } => format!("Downloading... {:.0}%", progress * 100.0),
+            OtaUpdateState::Uploading { progress } => format!("Uploading... {:.0}%", progress * 100.0),
+            OtaUpdateState::Confirming => "Confirming image...".to_string(),
+            OtaUpdateState::Rebooting => "Rebooting device...".to_string(),
+            OtaUpdateState::Verifying => "Verifying update...".to_string(),
+            OtaUpdateState::Complete => "Update complete!".to_string(),
+            OtaUpdateState::Failed { error } => format!("Failed: {}", error),
+            OtaUpdateState::Cancelled => "Cancelled".to_string(),
+        }
+    }
+
+    pub fn progress_value(&self) -> Option<f32> {
+        match self {
+            OtaUpdateState::Downloading { progress } => Some(*progress),
+            OtaUpdateState::Uploading { progress } => Some(*progress),
+            _ => None,
+        }
+    }
+}
+
+/// Start an OTA firmware update for a device (called from UI)
+pub fn start_ota_update(device_id: &str, base_url: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let device_id = device_id.to_string();
+        let base_url = base_url.to_string();
+
+        spawn_local(async move {
+            let url = format!("{}/api/ota/{}/start", base_url, device_id);
+
+            tracing::info!("Starting OTA update for device: {}", device_id);
+
+            match gloo_net::http::Request::post(&url).send().await {
+                Ok(response) => {
+                    if response.ok() {
+                        tracing::info!("OTA update started for device: {}", device_id);
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        tracing::error!("Failed to start OTA update: {} - {}", status, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start OTA update: {:?}", e);
+                }
+            }
+        });
+    }
+}
+
+/// Cancel an OTA firmware update for a device (called from UI)
+pub fn cancel_ota_update(device_id: &str, base_url: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let device_id = device_id.to_string();
+        let base_url = base_url.to_string();
+
+        spawn_local(async move {
+            let url = format!("{}/api/ota/{}/cancel", base_url, device_id);
+
+            tracing::info!("Cancelling OTA update for device: {}", device_id);
+
+            match gloo_net::http::Request::post(&url).send().await {
+                Ok(response) => {
+                    if response.ok() {
+                        tracing::info!("OTA update cancelled for device: {}", device_id);
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        tracing::error!("Failed to cancel OTA update: {} - {}", status, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to cancel OTA update: {:?}", e);
+                }
+            }
+        });
+    }
+}
+
+// ============================================================================
+// Local Firmware Upload (for development images)
+// ============================================================================
+
+/// Upload local firmware file to a device (called from UI after file picker)
+pub fn upload_local_firmware(device_id: &str, firmware_data: Vec<u8>, base_url: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+        use base64::Engine;
+
+        let device_id = device_id.to_string();
+        let base_url = base_url.to_string();
+
+        spawn_local(async move {
+            let url = format!("{}/api/ota/{}/upload-local", base_url, device_id);
+
+            tracing::info!("Uploading local firmware for device: {} ({} bytes)", device_id, firmware_data.len());
+
+            // Encode firmware as base64
+            let firmware_base64 = base64::engine::general_purpose::STANDARD.encode(&firmware_data);
+            let body = serde_json::json!({
+                "firmware_base64": firmware_base64
+            });
+
+            match gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .unwrap()
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.ok() {
+                        tracing::info!("Local firmware upload started for device: {}", device_id);
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        tracing::error!("Failed to upload local firmware: {} - {}", status, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to upload local firmware: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (device_id, firmware_data, base_url);
+        tracing::warn!("Local firmware upload not available in native mode");
+    }
+}
+
+// ============================================================================
+// HCDF Import/Export (for file picker)
+// ============================================================================
+
+/// Pending HCDF export data (used when fetching HCDF for file save)
+#[derive(Resource, Default)]
+pub struct PendingHcdfExport(pub Arc<Mutex<Option<Vec<u8>>>>);
+
+/// Export HCDF (fetch from backend for file save)
+pub fn export_hcdf(base_url: &str, pending: &PendingHcdfExport) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let base_url = base_url.to_string();
+        let pending_clone = pending.0.clone();
+
+        spawn_local(async move {
+            let url = format!("{}/api/hcdf/export", base_url);
+
+            tracing::info!("Fetching HCDF for export");
+
+            match gloo_net::http::Request::get(&url).send().await {
+                Ok(response) => {
+                    if response.ok() {
+                        if let Ok(text) = response.text().await {
+                            // Parse as JSON to extract the XML content
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(xml) = json.get("xml").and_then(|v| v.as_str()) {
+                                    if let Ok(mut data) = pending_clone.lock() {
+                                        *data = Some(xml.as_bytes().to_vec());
+                                    }
+                                    tracing::info!("HCDF export fetched successfully");
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::error!("Failed to export HCDF: {}", response.status());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to export HCDF: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (base_url, pending);
+        tracing::warn!("HCDF export not available in native mode");
+    }
+}
+
+/// Import HCDF (send to backend from file picker)
+pub fn import_hcdf(xml_content: String, merge: bool, base_url: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let base_url = base_url.to_string();
+
+        spawn_local(async move {
+            let url = format!("{}/api/hcdf/import", base_url);
+
+            tracing::info!("Importing HCDF ({} bytes, merge={})", xml_content.len(), merge);
+
+            let body = serde_json::json!({
+                "xml": xml_content,
+                "merge": merge
+            });
+
+            match gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .unwrap()
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.ok() {
+                        tracing::info!("HCDF imported successfully");
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        tracing::error!("Failed to import HCDF: {} - {}", status, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to import HCDF: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (xml_content, merge, base_url);
+        tracing::warn!("HCDF import not available in native mode");
+    }
+}
+
+/// Save HCDF to server filesystem (not browser download)
+pub fn save_hcdf_to_server(base_url: &str, filename: Option<&str>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let base_url = base_url.to_string();
+        let filename = filename.map(|s| s.to_string());
+
+        spawn_local(async move {
+            let url = format!("{}/api/hcdf/save", base_url);
+
+            tracing::info!("Saving HCDF to server");
+
+            let body = serde_json::json!({
+                "filename": filename
+            });
+
+            match gloo_net::http::Request::post(&url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .unwrap()
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.ok() {
+                        if let Ok(text) = response.text().await {
+                            tracing::info!("HCDF saved to server: {}", text);
+                        }
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        tracing::error!("Failed to save HCDF to server: {} - {}", status, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to save HCDF to server: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (base_url, filename);
+        tracing::warn!("HCDF save to server not available in native mode");
+    }
+}
+
+/// Update device position and orientation on the backend
+/// This syncs position changes to the HCDF so they're persisted on export
+pub fn update_device_position(
+    device_id: &str,
+    position: [f32; 3],
+    orientation: Option<[f32; 3]>,
+    base_url: &str,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+
+        let device_id = device_id.to_string();
+        let base_url = base_url.to_string();
+        // Convert f32 to f64 for the API
+        let position = [position[0] as f64, position[1] as f64, position[2] as f64];
+        let orientation = orientation.map(|o| [o[0] as f64, o[1] as f64, o[2] as f64]);
+
+        spawn_local(async move {
+            let url = format!("{}/api/devices/{}/position", base_url, device_id);
+
+            let body = serde_json::json!({
+                "position": position,
+                "orientation": orientation
+            });
+
+            tracing::warn!(
+                "Updating device {} position to {:?}, orientation {:?}",
+                device_id, position, orientation
+            );
+
+            match gloo_net::http::Request::put(&url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .unwrap()
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.ok() {
+                        tracing::warn!("Device {} position updated successfully", device_id);
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        tracing::error!(
+                            "Failed to update device {} position: {} - {}",
+                            device_id, status, text
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update device {} position: {:?}", device_id, e);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (device_id, position, orientation, base_url);
+        tracing::warn!("Device position update not available in native mode");
     }
 }
