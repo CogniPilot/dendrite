@@ -11,7 +11,9 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::firmware_fetch::FirmwareFetcher;
 use crate::hcdf_fetch::HcdfFetcher;
+use crate::ota::OtaService;
 
 /// Result of fetching and parsing an HCDF fragment
 #[derive(Debug, Default)]
@@ -34,6 +36,10 @@ pub struct AppState {
     pub fragments: Arc<RwLock<FragmentDatabase>>,
     /// Remote HCDF fetcher with caching
     pub hcdf_fetcher: Arc<HcdfFetcher>,
+    /// Firmware manifest fetcher
+    pub firmware_fetcher: Arc<FirmwareFetcher>,
+    /// OTA update service
+    pub ota_service: Arc<OtaService>,
     /// Configuration
     pub config: Config,
     /// Event broadcast for WebSocket clients
@@ -59,6 +65,12 @@ impl AppState {
             .join("cache");
         let hcdf_fetcher = Arc::new(HcdfFetcher::new(cache_dir)?);
 
+        // Create firmware fetcher
+        let firmware_fetcher = Arc::new(FirmwareFetcher::new()?);
+
+        // Create OTA service
+        let ota_service = Arc::new(OtaService::new(firmware_fetcher.clone()));
+
         // Create discovery scanner
         let scanner_config = config.to_scanner_config();
         let scanner = Arc::new(DiscoveryScanner::new(scanner_config));
@@ -72,6 +84,8 @@ impl AppState {
             topology: Arc::new(RwLock::new(topology)),
             fragments: Arc::new(RwLock::new(fragments)),
             hcdf_fetcher,
+            firmware_fetcher,
+            ota_service,
             config,
             events,
         });
@@ -107,11 +121,26 @@ impl AppState {
     }
 
     /// Update device in HCDF and topology, returns the (potentially modified) device
-    async fn update_device(&self, device: &Device) -> Device {
+    /// This applies fragment matching, fetches remote HCDF data, and updates topology
+    pub async fn update_device(&self, device: &Device) -> Device {
         let parent_name = self.config.parent.as_ref().map(|p| p.name.as_str());
 
         // Apply fragment matching if device doesn't have visuals
         let mut device = device.clone();
+
+        // Preserve existing pose from HCDF if device doesn't have one
+        // This ensures positions are restored on page refresh
+        if device.pose.is_none() {
+            let hcdf = self.hcdf.read().await;
+            if let Some(mcu) = hcdf.mcu.iter().find(|m| m.hwid.as_deref() == Some(device.id.as_str())) {
+                if let Some(pose_str) = &mcu.pose_cg {
+                    if let Some(pose) = parse_pose_string(pose_str) {
+                        device.pose = Some(pose.to_array());
+                        debug!(device = %device.id, pose = ?pose_str, "Restored pose from HCDF");
+                    }
+                }
+            }
+        }
         if device.visuals.is_empty() {
             if let (Some(board), Some(app)) = (&device.info.board, &device.firmware.name) {
                 // Try to fetch remote HCDF first (MCUmgr query + remote fetch)

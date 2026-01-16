@@ -4,7 +4,9 @@
 
 mod api;
 mod config;
+mod firmware_fetch;
 mod hcdf_fetch;
+mod ota;
 mod server;
 mod state;
 mod ws;

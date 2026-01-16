@@ -308,3 +308,749 @@ pub async fn get_heartbeat(
         "heartbeat_enabled": enabled
     }))
 }
+
+// ============================================================================
+// Device Position API Endpoints
+// ============================================================================
+
+/// Request to update device position
+#[derive(Deserialize)]
+pub struct UpdatePositionRequest {
+    /// Position in meters: [x, y, z]
+    pub position: [f64; 3],
+    /// Optional orientation in radians: [roll, pitch, yaw]
+    #[serde(default)]
+    pub orientation: Option<[f64; 3]>,
+}
+
+/// Update device position and orientation
+///
+/// PUT /api/devices/:id/position
+pub async fn update_device_position(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePositionRequest>,
+) -> impl IntoResponse {
+    tracing::warn!(device = %id, position = ?req.position, orientation = ?req.orientation, "Updating device position");
+
+    // Build pose array: [x, y, z, roll, pitch, yaw]
+    let pose = match req.orientation {
+        Some([roll, pitch, yaw]) => [req.position[0], req.position[1], req.position[2], roll, pitch, yaw],
+        None => [req.position[0], req.position[1], req.position[2], 0.0, 0.0, 0.0],
+    };
+
+    // Get the device from scanner
+    let device_id = DeviceId::from_hwid(&id);
+    let device = match state.scanner.get_device(&device_id).await {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("Device not found")),
+            )
+                .into_response();
+        }
+    };
+
+    // Update device pose and push back to scanner
+    let mut updated_device = device;
+    updated_device.pose = Some(pose);
+    state.scanner.update_device_silent(updated_device.clone()).await;
+
+    // Update pose_cg in the HCDF MCU element
+    {
+        let mut hcdf = state.hcdf.write().await;
+        let mcu_count = hcdf.mcu.len();
+        tracing::warn!(device_id = %id, mcu_count = mcu_count, "Looking for MCU in HCDF");
+
+        // Find MCU by hwid matching device id
+        let mut found = false;
+        for mcu in &mut hcdf.mcu {
+            if let Some(hwid) = &mcu.hwid {
+                tracing::warn!(hwid = %hwid, device_id = %id, "Checking MCU hwid");
+                if hwid == &id {
+                    // Format pose_cg as "x y z roll pitch yaw"
+                    mcu.pose_cg = Some(format!(
+                        "{} {} {} {} {} {}",
+                        pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]
+                    ));
+                    tracing::warn!(mcu = mcu.name, pose_cg = ?mcu.pose_cg, "Updated MCU pose_cg in HCDF");
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            tracing::warn!(device_id = %id, mcu_count = mcu_count, "MCU not found in HCDF, pose_cg will be saved on next upsert_device");
+        }
+    }
+
+    // Broadcast device update via WebSocket
+    state.scanner.broadcast_device_update(updated_device).await;
+
+    Json(serde_json::json!({
+        "status": "updated",
+        "device_id": id,
+        "pose": pose
+    }))
+    .into_response()
+}
+
+// ============================================================================
+// Firmware API Endpoints
+// ============================================================================
+
+/// Firmware check response
+#[derive(Serialize)]
+pub struct FirmwareCheckResponse {
+    pub device_id: String,
+    pub current_version: Option<String>,
+    /// MCUboot image hash from the device (what MCUmgr reports)
+    pub current_mcuboot_hash: Option<String>,
+    pub latest_version: Option<String>,
+    /// MCUboot image hash for the latest release (for verification after OTA)
+    pub latest_mcuboot_hash: Option<String>,
+    pub status: dendrite_core::FirmwareStatus,
+    pub changelog: Option<String>,
+}
+
+/// Check firmware status for a specific device
+///
+/// GET /api/firmware/:id/check
+pub async fn check_firmware(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Get device
+    let device = match state.get_device(&id).await {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("Device not found")),
+            )
+                .into_response()
+        }
+    };
+
+    // Need board and app name to fetch manifest
+    let board = match &device.info.board {
+        Some(b) => b.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new("Device has no board info")),
+            )
+                .into_response()
+        }
+    };
+
+    let app = match &device.firmware.name {
+        Some(a) => a.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new("Device has no app name")),
+            )
+                .into_response()
+        }
+    };
+
+    // Get firmware_manifest_uri from HCDF software element
+    let firmware_manifest_uri = {
+        let hcdf = state.hcdf.read().await;
+        hcdf.mcu
+            .iter()
+            .find(|m| m.hwid.as_deref() == Some(&id))
+            .and_then(|m| m.software.as_ref())
+            .and_then(|s| s.firmware_manifest_uri.clone())
+    };
+
+    info!(device = %id, board = %board, app = %app, uri = ?firmware_manifest_uri, "Checking firmware status");
+
+    // Fetch firmware manifest (requires explicit firmware_manifest_uri)
+    let manifest = match state.firmware_fetcher.get_manifest(&board, &app, firmware_manifest_uri.as_deref()).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Json(FirmwareCheckResponse {
+                device_id: id,
+                current_version: device.firmware.version.clone(),
+                current_mcuboot_hash: device.firmware.image_hash.clone(),
+                latest_version: None,
+                latest_mcuboot_hash: None,
+                status: dendrite_core::FirmwareStatus::Unknown,
+                changelog: None,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::new(format!("Failed to fetch manifest: {}", e))),
+            )
+                .into_response()
+        }
+    };
+
+    // Compare versions
+    let status = dendrite_core::compare_versions(
+        device.firmware.version.as_deref(),
+        device.firmware.build_date,
+        &manifest,
+    );
+
+    Json(FirmwareCheckResponse {
+        device_id: id,
+        current_version: device.firmware.version.clone(),
+        current_mcuboot_hash: device.firmware.image_hash.clone(),
+        latest_version: Some(manifest.latest.version.clone()),
+        latest_mcuboot_hash: Some(manifest.latest.mcuboot_hash.clone()),
+        status,
+        changelog: manifest.latest.changelog.clone(),
+    })
+    .into_response()
+}
+
+/// Check firmware for all devices
+///
+/// GET /api/firmware/check
+pub async fn check_all_firmware(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let devices = state.devices().await;
+    let mut results = Vec::new();
+
+    for device in devices {
+        let id = device.id.0.clone();
+
+        // Skip devices without board/app info
+        let (board, app) = match (&device.info.board, &device.firmware.name) {
+            (Some(b), Some(a)) => (b.clone(), a.clone()),
+            _ => {
+                results.push(FirmwareCheckResponse {
+                    device_id: id,
+                    current_version: device.firmware.version.clone(),
+                    current_mcuboot_hash: device.firmware.image_hash.clone(),
+                    latest_version: None,
+                    latest_mcuboot_hash: None,
+                    status: dendrite_core::FirmwareStatus::Unknown,
+                    changelog: None,
+                });
+                continue;
+            }
+        };
+
+        // Get firmware_manifest_uri from HCDF software element
+        let firmware_manifest_uri = {
+            let hcdf = state.hcdf.read().await;
+            hcdf.mcu
+                .iter()
+                .find(|m| m.hwid.as_deref() == Some(&id))
+                .and_then(|m| m.software.as_ref())
+                .and_then(|s| s.firmware_manifest_uri.clone())
+        };
+
+        // Fetch manifest (requires explicit firmware_manifest_uri)
+        let (latest_version, latest_mcuboot_hash, status, changelog) =
+            match state.firmware_fetcher.get_manifest(&board, &app, firmware_manifest_uri.as_deref()).await {
+                Ok(Some(manifest)) => {
+                    let status = dendrite_core::compare_versions(
+                        device.firmware.version.as_deref(),
+                        device.firmware.build_date,
+                        &manifest,
+                    );
+                    (
+                        Some(manifest.latest.version.clone()),
+                        Some(manifest.latest.mcuboot_hash.clone()),
+                        status,
+                        manifest.latest.changelog.clone(),
+                    )
+                }
+                _ => (None, None, dendrite_core::FirmwareStatus::Unknown, None),
+            };
+
+        results.push(FirmwareCheckResponse {
+            device_id: id,
+            current_version: device.firmware.version.clone(),
+            current_mcuboot_hash: device.firmware.image_hash.clone(),
+            latest_version,
+            latest_mcuboot_hash,
+            status,
+            changelog,
+        });
+    }
+
+    Json(results)
+}
+
+// ============================================================================
+// OTA (Over-The-Air) Update API Endpoints
+// ============================================================================
+
+use crate::ota::UpdateState;
+
+/// OTA update start response
+#[derive(Serialize)]
+pub struct OtaStartResponse {
+    pub device_id: String,
+    pub status: String,
+}
+
+/// OTA update progress response
+#[derive(Serialize)]
+pub struct OtaProgressResponse {
+    pub device_id: String,
+    pub state: Option<UpdateState>,
+}
+
+/// Start an OTA firmware update for a device
+///
+/// POST /api/ota/:id/start
+pub async fn start_ota_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Get device
+    let device = match state.get_device(&id).await {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("Device not found")),
+            )
+                .into_response()
+        }
+    };
+
+    // Need board and app name for firmware fetching
+    let board = match &device.info.board {
+        Some(b) => b.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new("Device has no board info")),
+            )
+                .into_response()
+        }
+    };
+
+    let app = match &device.firmware.name {
+        Some(a) => a.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new("Device has no app name")),
+            )
+                .into_response()
+        }
+    };
+
+    // Get firmware_manifest_uri from HCDF software element
+    let firmware_manifest_uri = {
+        let hcdf = state.hcdf.read().await;
+        hcdf.mcu
+            .iter()
+            .find(|m| m.hwid.as_deref() == Some(&id))
+            .and_then(|m| m.software.as_ref())
+            .and_then(|s| s.firmware_manifest_uri.clone())
+    };
+
+    info!(device = %id, board = %board, app = %app, uri = ?firmware_manifest_uri, "Starting OTA update");
+
+    // Start the update (requires explicit firmware_manifest_uri)
+    match state
+        .ota_service
+        .start_update(id.clone(), device.discovery.ip.to_string(), board, app, firmware_manifest_uri)
+        .await
+    {
+        Ok(()) => Json(OtaStartResponse {
+            device_id: id,
+            status: "started".to_string(),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(ApiError::new(format!("Failed to start update: {}", e))),
+        )
+            .into_response(),
+    }
+}
+
+/// Get OTA update progress for a device
+///
+/// GET /api/ota/:id/progress
+pub async fn get_ota_progress(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let update_state = state.ota_service.get_state(&id).await;
+
+    Json(OtaProgressResponse {
+        device_id: id,
+        state: update_state,
+    })
+}
+
+/// Get all active OTA updates
+///
+/// GET /api/ota
+pub async fn get_all_ota_updates(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let updates = state.ota_service.get_all_updates().await;
+
+    let responses: Vec<OtaProgressResponse> = updates
+        .into_iter()
+        .map(|(device_id, update_state)| OtaProgressResponse {
+            device_id,
+            state: Some(update_state),
+        })
+        .collect();
+
+    Json(responses)
+}
+
+/// Cancel an OTA update for a device
+///
+/// POST /api/ota/:id/cancel
+pub async fn cancel_ota_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    info!(device = %id, "Cancelling OTA update");
+
+    match state.ota_service.cancel_update(&id).await {
+        Ok(()) => Json(serde_json::json!({
+            "device_id": id,
+            "status": "cancelled"
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(format!("Failed to cancel update: {}", e))),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for local firmware upload
+#[derive(Deserialize)]
+pub struct LocalFirmwareUpload {
+    /// Base64-encoded firmware binary
+    pub firmware_base64: String,
+}
+
+/// Upload local firmware binary to a device (for development use)
+///
+/// POST /api/ota/:id/upload-local
+///
+/// This allows uploading a local firmware binary directly without going through
+/// the firmware repository. Useful for development and testing.
+pub async fn upload_local_firmware(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<LocalFirmwareUpload>,
+) -> impl IntoResponse {
+    // Get device
+    let device = match state.get_device(&id).await {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("Device not found")),
+            )
+                .into_response()
+        }
+    };
+
+    // Decode base64 firmware
+    use base64::Engine;
+    let firmware_data = match base64::engine::general_purpose::STANDARD.decode(&req.firmware_base64) {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(format!("Invalid base64 firmware data: {}", e))),
+            )
+                .into_response()
+        }
+    };
+
+    info!(
+        device = %id,
+        size = firmware_data.len(),
+        "Starting local firmware upload"
+    );
+
+    // Start the upload
+    match state
+        .ota_service
+        .upload_local_firmware(id.clone(), device.discovery.ip.to_string(), firmware_data)
+        .await
+    {
+        Ok(()) => Json(OtaStartResponse {
+            device_id: id,
+            status: "started".to_string(),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(ApiError::new(format!("Failed to start local upload: {}", e))),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// HCDF Import/Export API Endpoints
+// ============================================================================
+
+/// Export the current HCDF as XML
+///
+/// GET /api/hcdf/export
+pub async fn export_hcdf(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let hcdf = state.hcdf.read().await;
+
+    match hcdf.to_xml() {
+        Ok(xml) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "xml": xml })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(format!("Failed to export HCDF: {}", e))),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for HCDF import
+#[derive(Deserialize)]
+pub struct HcdfImportRequest {
+    /// HCDF XML content
+    pub xml: String,
+    /// Whether to merge with existing HCDF (true) or replace (false)
+    #[serde(default)]
+    pub merge: bool,
+}
+
+/// Import HCDF from XML
+///
+/// POST /api/hcdf/import
+pub async fn import_hcdf(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HcdfImportRequest>,
+) -> impl IntoResponse {
+    use dendrite_core::{Hcdf, Device, DeviceId, DeviceStatus, DeviceInfo, FirmwareInfo, parse_pose_string};
+    use dendrite_core::device::{DiscoveryInfo, DiscoveryMethod};
+    use chrono::{DateTime, Utc};
+    use std::net::IpAddr;
+
+    // Parse the incoming HCDF
+    let imported_hcdf = match Hcdf::from_xml(&req.xml) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(format!("Invalid HCDF XML: {}", e))),
+            )
+                .into_response()
+        }
+    };
+
+    // Collect MCUs to convert to devices
+    let mcus_to_import: Vec<_> = imported_hcdf.mcu.clone();
+    let mcu_count = mcus_to_import.len();
+
+    // Update HCDF state
+    {
+        let mut hcdf = state.hcdf.write().await;
+        if req.merge {
+            // TODO: Implement proper merge logic
+            // For now, just warn and replace
+            info!("HCDF merge not yet implemented, replacing instead");
+        }
+        *hcdf = imported_hcdf;
+        info!("Replaced HCDF with imported data ({} MCUs)", mcu_count);
+    }
+
+    // Convert MCUs to Devices and add to scanner (which broadcasts events)
+    for mcu in mcus_to_import {
+        // Need hwid to create device ID
+        let device_id = match &mcu.hwid {
+            Some(hwid) => DeviceId::from_hwid(hwid),
+            None => {
+                info!("Skipping MCU '{}' - no hwid", mcu.name);
+                continue;
+            }
+        };
+
+        // Parse IP from discovered info
+        let (ip, port, last_seen) = match &mcu.discovered {
+            Some(disc) => {
+                let ip: IpAddr = match disc.ip.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => {
+                        info!("Skipping MCU '{}' - invalid IP '{}'", mcu.name, disc.ip);
+                        continue;
+                    }
+                };
+                let port: u16 = disc.port.map(|p| p as u16).unwrap_or(1337);
+                let last_seen = disc.last_seen
+                    .as_ref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(Utc::now);
+                (ip, port, last_seen)
+            }
+            None => {
+                info!("Skipping MCU '{}' - no discovery info", mcu.name);
+                continue;
+            }
+        };
+
+        // Build firmware info from software element
+        let firmware = mcu.software.as_ref().map(|sw| FirmwareInfo {
+            name: Some(sw.name.clone()),
+            version: sw.version.clone(),
+            build_date: None,
+            image_hash: sw.hash.clone(),
+            confirmed: true,
+            pending: false,
+            slot: None,
+        }).unwrap_or_default();
+
+        // Build device info
+        let info = DeviceInfo {
+            os_name: Some("Zephyr".to_string()),
+            board: mcu.board.clone(),
+            processor: None,
+            bootloader: None,
+            mcuboot_mode: None,
+        };
+
+        // Parse pose from pose_cg string
+        let pose: Option<[f64; 6]> = mcu.pose_cg.as_ref().and_then(|s| {
+            parse_pose_string(s).map(|p| [p.x, p.y, p.z, p.roll, p.pitch, p.yaw])
+        });
+
+        // Create device
+        let mut device = Device {
+            id: device_id,
+            name: mcu.name.clone(),
+            status: DeviceStatus::Unknown, // Will be checked by heartbeat
+            discovery: DiscoveryInfo {
+                ip,
+                port,
+                switch_port: mcu.discovered.as_ref().and_then(|d| d.port),
+                mac: None,
+                first_seen: last_seen,
+                last_seen,
+                discovery_method: DiscoveryMethod::Manual,
+            },
+            info,
+            firmware,
+            firmware_status: Default::default(),
+            firmware_manifest_uri: mcu.software.as_ref().and_then(|s| s.firmware_manifest_uri.clone()),
+            parent_id: None,
+            model_path: mcu.model.as_ref().map(|m| m.href.clone()),
+            pose,
+            visuals: Vec::new(),
+            frames: Vec::new(),
+            ports: Vec::new(),
+            sensors: Vec::new(),
+        };
+
+        // Let AppState apply fragment matching and other enrichment
+        device = state.update_device(&device).await;
+
+        // Add to scanner (this broadcasts DeviceDiscovered event to WebSocket clients)
+        state.scanner.add_device(device).await;
+        info!("Imported device '{}' from HCDF", mcu.name);
+    }
+
+    Json(serde_json::json!({
+        "status": "imported",
+        "merge": req.merge,
+        "devices_imported": mcu_count
+    }))
+    .into_response()
+}
+
+/// Request body for HCDF save to server
+#[derive(Deserialize)]
+pub struct HcdfSaveRequest {
+    /// Optional filename (without path) - defaults to "dendrite_config.hcdf"
+    #[serde(default)]
+    pub filename: Option<String>,
+}
+
+/// Save HCDF to server filesystem
+///
+/// POST /api/hcdf/save
+pub async fn save_hcdf_to_server(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HcdfSaveRequest>,
+) -> impl IntoResponse {
+    use std::path::PathBuf;
+    use tokio::fs;
+
+    let hcdf = state.hcdf.read().await;
+
+    let xml = match hcdf.to_xml() {
+        Ok(xml) => xml,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(format!("Failed to serialize HCDF: {}", e))),
+            )
+                .into_response()
+        }
+    };
+
+    // Determine save path - use config hcdf_path directory or default to current dir
+    let filename = req.filename.unwrap_or_else(|| "dendrite_config.hcdf".to_string());
+
+    // Sanitize filename - only allow alphanumeric, underscore, hyphen, and .hcdf extension
+    let sanitized_filename = filename
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect::<String>();
+
+    // Ensure .hcdf extension
+    let sanitized_filename = if sanitized_filename.ends_with(".hcdf") {
+        sanitized_filename
+    } else {
+        format!("{}.hcdf", sanitized_filename)
+    };
+
+    // Save to the configured hcdf path directory, or current directory if not set
+    let hcdf_path = PathBuf::from(&state.config.hcdf.path);
+    let parent = hcdf_path.parent().unwrap_or(std::path::Path::new("."));
+    let save_path = parent.join(&sanitized_filename);
+
+    info!("Saving HCDF to server: {:?}", save_path);
+
+    match fs::write(&save_path, &xml).await {
+        Ok(()) => {
+            info!("HCDF saved successfully to {:?}", save_path);
+            Json(serde_json::json!({
+                "status": "saved",
+                "path": save_path.to_string_lossy(),
+                "size": xml.len()
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(format!("Failed to write HCDF file: {}", e))),
+            )
+                .into_response()
+        }
+    }
+}

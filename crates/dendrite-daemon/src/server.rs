@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -41,6 +41,21 @@ pub async fn run(state: Arc<AppState>, bind: &str, tls: Option<&TlsConfig>) -> R
         .route("/api/subnet", post(api::update_subnet))
         .route("/api/heartbeat", get(api::get_heartbeat))
         .route("/api/heartbeat", post(api::set_heartbeat))
+        // Device position updates
+        .route("/api/devices/{id}/position", put(api::update_device_position))
+        // Firmware checking
+        .route("/api/firmware/check", get(api::check_all_firmware))
+        .route("/api/firmware/{id}/check", get(api::check_firmware))
+        // OTA firmware updates
+        .route("/api/ota", get(api::get_all_ota_updates))
+        .route("/api/ota/{id}/start", post(api::start_ota_update))
+        .route("/api/ota/{id}/progress", get(api::get_ota_progress))
+        .route("/api/ota/{id}/cancel", post(api::cancel_ota_update))
+        .route("/api/ota/{id}/upload-local", post(api::upload_local_firmware))
+        // HCDF import/export (for file picker)
+        .route("/api/hcdf/export", get(api::export_hcdf))
+        .route("/api/hcdf/import", post(api::import_hcdf))
+        .route("/api/hcdf/save", post(api::save_hcdf_to_server))
         // WebSocket for real-time updates
         .route("/ws", get(ws::websocket_handler))
         // Serve cached models (from remote HCDF fetch) - takes precedence
