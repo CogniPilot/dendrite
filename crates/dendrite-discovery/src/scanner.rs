@@ -396,14 +396,14 @@ impl DiscoveryScanner {
 
     /// Run continuous discovery in background
     /// Only runs heartbeat checks - full MCUmgr scans are manual only
+    /// NOTE: No initial scan on startup - user must manually trigger scan
+    /// This allows HCDF to be loaded from file without competing with auto-discovery
     pub async fn run(&self) -> Result<()> {
         use tokio::time::interval;
 
-        // Do initial full scan on startup
-        info!("Running initial MCUmgr discovery scan");
-        if let Err(e) = self.scan_once().await {
-            warn!(error = %e, "Initial discovery scan failed");
-        }
+        // No initial scan - user triggers scans manually via UI
+        // This prevents auto-discovery from competing with imported HCDF configurations
+        info!("Scanner ready (no auto-scan on startup - use UI to trigger discovery)");
 
         // Use a fixed 2-second interval, but check config each time to see if heartbeat is enabled
         let mut heartbeat_interval = interval(Duration::from_secs(2));
@@ -440,6 +440,11 @@ impl DiscoveryScanner {
     pub async fn update_device_silent(&self, device: Device) {
         let mut devices = self.devices.write().await;
         devices.insert(device.id.0.clone(), device);
+    }
+
+    /// Broadcast a device update event (for position/orientation changes, etc.)
+    pub async fn broadcast_device_update(&self, device: Device) {
+        let _ = self.event_tx.send(DiscoveryEvent::DeviceUpdated(device));
     }
 
     /// Remove a device by ID string, returns true if device was found and removed

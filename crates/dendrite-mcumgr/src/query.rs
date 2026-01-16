@@ -461,7 +461,8 @@ pub fn query_result_to_device(
         device.firmware = FirmwareInfo {
             name: result.app_name.clone(),
             version: Some(img.version.clone()),
-            hash: Some(img.hash.clone()),
+            build_date: None, // Not available from MCUmgr image_state
+            image_hash: Some(img.hash.clone()),
             confirmed: img.confirmed,
             pending: img.pending,
             slot: Some(img.slot),

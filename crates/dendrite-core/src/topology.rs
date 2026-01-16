@@ -270,6 +270,8 @@ mod tests {
             },
             info: Default::default(),
             firmware: Default::default(),
+            firmware_status: Default::default(),
+            firmware_manifest_uri: None,
             parent_id: None,
             model_path: None,
             pose: None,

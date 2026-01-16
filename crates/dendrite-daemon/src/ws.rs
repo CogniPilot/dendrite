@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::ota::{OtaEvent, UpdateState};
 use crate::state::AppState;
 
 /// WebSocket message types
@@ -31,6 +32,8 @@ enum WsMessage {
     ScanStarted,
     #[serde(rename = "scan_completed")]
     ScanCompleted { found: usize, total: usize },
+    #[serde(rename = "ota_progress")]
+    OtaProgress { device_id: String, state: UpdateState },
     #[serde(rename = "pong")]
     Pong,
 }
@@ -45,7 +48,8 @@ pub async fn websocket_handler(
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
-    let mut events = state.subscribe();
+    let mut discovery_events = state.subscribe();
+    let mut ota_events = state.ota_service.subscribe();
 
     info!("WebSocket client connected");
 
@@ -64,7 +68,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     loop {
         tokio::select! {
             // Forward discovery events to client
-            event = events.recv() => {
+            event = discovery_events.recv() => {
                 match event {
                     Ok(event) => {
                         let msg = match event {
@@ -93,8 +97,30 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     Err(e) => {
-                        debug!(error = %e, "Event channel error");
+                        debug!(error = %e, "Discovery event channel error");
                         break;
+                    }
+                }
+            }
+
+            // Forward OTA events to client
+            event = ota_events.recv() => {
+                match event {
+                    Ok(OtaEvent { device_id, state }) => {
+                        let msg = WsMessage::OtaProgress { device_id, state };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(skipped = n, "OTA event channel lagged");
+                        // Continue - lagging is not fatal
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "OTA event channel error");
+                        // OTA channel closed is not fatal - continue with discovery events
                     }
                 }
             }
