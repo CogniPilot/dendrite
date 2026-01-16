@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use bevy_egui::EguiPlugin;
 use bevy_picking::{DefaultPickingPlugins, prelude::MeshPickingPlugin};
 
+use crate::file_picker::FilePickerPlugin;
 use crate::models::ModelsPlugin;
 use crate::network::NetworkPlugin;
 use crate::scene::ScenePlugin;
@@ -121,6 +122,8 @@ pub struct DeviceData {
     pub status: DeviceStatus,
     pub version: Option<String>,
     pub position: Option<[f64; 3]>,
+    /// Orientation as [roll, pitch, yaw] in radians
+    pub orientation: Option<[f64; 3]>,
     /// Legacy single model path (for backward compatibility)
     pub model_path: Option<String>,
     /// Composite visuals with individual poses
@@ -140,6 +143,41 @@ pub enum DeviceStatus {
     Offline,
     #[default]
     Unknown,
+}
+
+/// Firmware status for a device
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum FirmwareStatusData {
+    /// Device firmware is up to date
+    UpToDate,
+    /// Newer firmware is available
+    UpdateAvailable {
+        latest_version: String,
+        changelog: Option<String>,
+    },
+    /// Couldn't determine firmware status
+    #[default]
+    Unknown,
+    /// Firmware checking is disabled
+    CheckDisabled,
+}
+
+/// Firmware check state - global toggle and per-device status
+#[derive(Debug, Clone, Resource, Default)]
+pub struct FirmwareCheckState {
+    /// Whether firmware checking is enabled
+    pub enabled: bool,
+    /// Per-device firmware status (device_id -> status)
+    pub device_status: std::collections::HashMap<String, FirmwareStatusData>,
+    /// Loading states for devices being checked
+    pub loading: std::collections::HashSet<String>,
+}
+
+/// OTA update state - tracks in-progress firmware updates
+#[derive(Debug, Clone, Resource, Default)]
+pub struct OtaState {
+    /// Per-device OTA update status (device_id -> state)
+    pub device_updates: std::collections::HashMap<String, crate::network::OtaUpdateState>,
 }
 
 /// Currently selected device
@@ -512,6 +550,51 @@ impl Default for ConnectionDialog {
     }
 }
 
+/// Graph visualization overlay state
+#[derive(Debug, Clone, Resource)]
+pub struct GraphVisualization {
+    /// Whether the graph overlay is shown
+    pub show: bool,
+    /// Pan offset for scrolling the graph
+    pub pan_offset: [f32; 2],
+    /// Zoom level (1.0 = 100%)
+    pub zoom: f32,
+    /// Currently hovered node ID
+    pub hovered_node: Option<String>,
+    /// Cached topology data
+    pub topology: Option<TopologyData>,
+}
+
+/// Topology data for graph visualization
+#[derive(Debug, Clone)]
+pub struct TopologyData {
+    pub nodes: Vec<TopologyNode>,
+    pub root: Option<String>,
+}
+
+/// A node in the topology graph
+#[derive(Debug, Clone)]
+pub struct TopologyNode {
+    pub id: String,
+    pub name: String,
+    pub board: Option<String>,
+    pub is_parent: bool,
+    pub port: Option<u8>,
+    pub children: Vec<String>,
+}
+
+impl Default for GraphVisualization {
+    fn default() -> Self {
+        Self {
+            show: false,
+            pan_offset: [0.0, 0.0],
+            zoom: 1.0,
+            hovered_node: None,
+            topology: None,
+        }
+    }
+}
+
 /// Run the Bevy application
 pub fn run() {
     App::new()
@@ -554,6 +637,10 @@ pub fn run() {
         .init_resource::<WorldSettings>()
         .init_resource::<UiLayout>()
         .init_resource::<ConnectionDialog>()
+        .init_resource::<FirmwareCheckState>()
+        .init_resource::<OtaState>()
+        .init_resource::<GraphVisualization>()
+        .add_plugins(FilePickerPlugin)
         .add_plugins(NetworkPlugin)
         .add_plugins(ScenePlugin)
         .add_plugins(ModelsPlugin)

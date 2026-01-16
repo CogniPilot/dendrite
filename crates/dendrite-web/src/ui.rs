@@ -1,19 +1,104 @@
 //! UI overlays using bevy_egui
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FrameVisibility, SelectedDevice, ShowRotationAxis, UiLayout, WorldSettings};
-use crate::network::{DaemonConfig, HeartbeatState, NetworkInterfaces, ReconnectEvent, toggle_heartbeat, trigger_scan_on_interface};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, ConnectionDialog, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FirmwareCheckState, FirmwareStatusData, FrameVisibility, GraphVisualization, OtaState, SelectedDevice, ShowRotationAxis, TopologyData, TopologyNode, UiLayout, WorldSettings};
+use crate::network::{cancel_ota_update, check_all_firmware, DaemonConfig, HeartbeatState, NetworkInterfaces, OtaUpdateState, PendingFirmwareData, PendingHcdfExport, ReconnectEvent, start_ota_update, toggle_heartbeat, trigger_scan_on_interface, upload_local_firmware, export_hcdf, import_hcdf, save_hcdf_to_server, update_device_position};
+use crate::file_picker::{FileFilter, FilePickerContext, FilePickerState, PendingFileResults, trigger_file_open, trigger_file_save};
+
+/// Grouped system parameters for the main UI system to work around Bevy's 16-param limit
+#[derive(SystemParam)]
+pub struct UiParams<'w, 's> {
+    pub contexts: EguiContexts<'w, 's>,
+    pub registry: Res<'w, DeviceRegistry>,
+    pub selected: ResMut<'w, SelectedDevice>,
+    pub camera_settings: ResMut<'w, CameraSettings>,
+    pub positions: ResMut<'w, DevicePositions>,
+    pub orientations: ResMut<'w, DeviceOrientations>,
+    pub active_rotation_field: ResMut<'w, ActiveRotationField>,
+    pub show_rotation_axis: ResMut<'w, ShowRotationAxis>,
+    pub world_settings: ResMut<'w, WorldSettings>,
+    pub frame_visibility: ResMut<'w, FrameVisibility>,
+    pub device_query: Query<'w, 's, (&'static crate::scene::DeviceEntity, &'static mut Transform)>,
+    pub network_interfaces: ResMut<'w, NetworkInterfaces>,
+    pub heartbeat_state: ResMut<'w, HeartbeatState>,
+    pub firmware_state: ResMut<'w, FirmwareCheckState>,
+    pub pending_firmware: Res<'w, PendingFirmwareData>,
+    pub ui_layout: ResMut<'w, UiLayout>,
+    pub daemon_config: Res<'w, DaemonConfig>,
+    pub connection_dialog: ResMut<'w, ConnectionDialog>,
+    pub reconnect_events: MessageWriter<'w, ReconnectEvent>,
+    pub ota_state: ResMut<'w, OtaState>,
+    pub file_picker_state: ResMut<'w, FilePickerState>,
+    pub pending_file_results: Res<'w, PendingFileResults>,
+    pub pending_hcdf_export: Res<'w, PendingHcdfExport>,
+    pub graph_vis: ResMut<'w, GraphVisualization>,
+}
 
 pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         // UI layout updates run in Update
-        app.add_systems(Update, update_ui_layout)
+        app.add_systems(Update, (update_ui_layout, process_file_picker_results))
             // Main UI system runs in EguiPrimaryContextPass for proper input handling (bevy_egui 0.38+)
             .add_systems(EguiPrimaryContextPass, ui_system);
+    }
+}
+
+/// Process completed file picker results and dispatch to appropriate handlers
+fn process_file_picker_results(
+    mut file_picker_state: ResMut<FilePickerState>,
+    pending_hcdf_export: Res<PendingHcdfExport>,
+    daemon_config: Res<DaemonConfig>,
+) {
+    // Process completed file picker results
+    while let Some(result) = file_picker_state.take_result() {
+        if !result.success {
+            tracing::error!("File picker operation failed: {:?}", result.error);
+            continue;
+        }
+
+        match result.context {
+            FilePickerContext::FirmwareUpload { device_id } => {
+                if let Some(content) = result.content {
+                    tracing::info!("Uploading local firmware to device {}: {} ({} bytes)",
+                        device_id, result.filename, content.len());
+                    upload_local_firmware(&device_id, content, &daemon_config.http_url);
+                }
+            }
+            FilePickerContext::HcdfImport => {
+                if let Some(content) = result.content {
+                    // Convert bytes to string
+                    if let Ok(xml) = String::from_utf8(content) {
+                        tracing::warn!("Importing HCDF file: {} ({} bytes)", result.filename, xml.len());
+                        import_hcdf(xml, false, &daemon_config.http_url);
+                    } else {
+                        tracing::error!("HCDF file is not valid UTF-8");
+                    }
+                }
+            }
+            FilePickerContext::HcdfExport => {
+                // Export was completed (file saved via browser download)
+                tracing::info!("HCDF export completed: {}", result.filename);
+            }
+            FilePickerContext::Custom(name) => {
+                tracing::info!("Custom file picker result for '{}': {}", name, result.filename);
+            }
+        }
+    }
+
+    // Check for pending HCDF export data and trigger file save
+    if let Ok(mut export_data) = pending_hcdf_export.0.lock() {
+        if let Some(content) = export_data.take() {
+            // We have HCDF content ready - this means we need to save it
+            // But we need access to PendingFileResults to trigger the save
+            // This will be handled in the UI system where we have access to all resources
+            // For now, store it back - the UI will handle it
+            *export_data = Some(content);
+        }
     }
 }
 
@@ -35,31 +120,13 @@ fn update_ui_layout(
     }
 }
 
-fn ui_system(
-    mut contexts: EguiContexts,
-    registry: Res<DeviceRegistry>,
-    mut selected: ResMut<SelectedDevice>,
-    mut camera_settings: ResMut<CameraSettings>,
-    mut positions: ResMut<DevicePositions>,
-    mut orientations: ResMut<DeviceOrientations>,
-    mut rotation_state: (ResMut<ActiveRotationField>, ResMut<ShowRotationAxis>),
-    mut world_settings: ResMut<WorldSettings>,
-    mut frame_visibility: ResMut<FrameVisibility>,
-    mut device_query: Query<(&crate::scene::DeviceEntity, &mut Transform)>,
-    mut network_interfaces: ResMut<NetworkInterfaces>,
-    mut heartbeat_state: ResMut<HeartbeatState>,
-    mut ui_layout: ResMut<UiLayout>,
-    daemon_config: Res<DaemonConfig>,
-    mut connection_dialog: ResMut<ConnectionDialog>,
-    mut reconnect_events: MessageWriter<ReconnectEvent>,
-) {
-    let (ref mut active_rotation_field, ref mut show_rotation_axis) = rotation_state;
-    let is_mobile = ui_layout.is_mobile;
-    let panel_width = ui_layout.panel_width();
-    let ui_scale = ui_layout.ui_scale;
+fn ui_system(mut params: UiParams) {
+    let is_mobile = params.ui_layout.is_mobile;
+    let panel_width = params.ui_layout.panel_width();
+    let ui_scale = params.ui_layout.ui_scale;
 
     // Get the egui context - early return if not available
-    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let Ok(ctx) = params.contexts.ctx_mut() else { return };
 
     // Set up style for mobile - larger text and touch targets
     if is_mobile {
@@ -75,19 +142,19 @@ fn ui_system(
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Menu toggle button
-                    let menu_text = if ui_layout.show_left_panel { "☰ Menu" } else { "☰" };
+                    let menu_text = if params.ui_layout.show_left_panel { "☰ Menu" } else { "☰" };
                     if ui.button(egui::RichText::new(menu_text).size(16.0 * ui_scale)).clicked() {
-                        ui_layout.show_left_panel = !ui_layout.show_left_panel;
+                        params.ui_layout.show_left_panel = !params.ui_layout.show_left_panel;
                         // Hide other panel when opening this one on mobile
-                        if ui_layout.show_left_panel {
-                            ui_layout.show_right_panel = false;
+                        if params.ui_layout.show_left_panel {
+                            params.ui_layout.show_right_panel = false;
                         }
                     }
 
                     ui.separator();
 
                     // Connection status indicator
-                    let status_color = if registry.connected {
+                    let status_color = if params.registry.connected {
                         egui::Color32::GREEN
                     } else {
                         egui::Color32::RED
@@ -96,13 +163,13 @@ fn ui_system(
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Details toggle (only if device selected)
-                        if selected.0.is_some() {
-                            let details_text = if ui_layout.show_right_panel { "Details ✕" } else { "Details" };
+                        if params.selected.0.is_some() {
+                            let details_text = if params.ui_layout.show_right_panel { "Details ✕" } else { "Details" };
                             if ui.button(egui::RichText::new(details_text).size(16.0 * ui_scale)).clicked() {
-                                ui_layout.show_right_panel = !ui_layout.show_right_panel;
+                                params.ui_layout.show_right_panel = !params.ui_layout.show_right_panel;
                                 // Hide other panel when opening this one on mobile
-                                if ui_layout.show_right_panel {
-                                    ui_layout.show_left_panel = false;
+                                if params.ui_layout.show_right_panel {
+                                    params.ui_layout.show_left_panel = false;
                                 }
                             }
                         }
@@ -112,7 +179,7 @@ fn ui_system(
     }
 
     // Device list panel (left side)
-    if !is_mobile || ui_layout.show_left_panel {
+    if !is_mobile || params.ui_layout.show_left_panel {
         egui::SidePanel::left("devices_panel")
             .default_width(panel_width)
             .resizable(!is_mobile)
@@ -123,7 +190,7 @@ fn ui_system(
                         ui.heading(egui::RichText::new("Devices").size(18.0 * ui_scale));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(egui::RichText::new("✕").size(18.0 * ui_scale)).clicked() {
-                                ui_layout.show_left_panel = false;
+                                params.ui_layout.show_left_panel = false;
                             }
                         });
                     });
@@ -133,20 +200,23 @@ fn ui_system(
 
                 ui.separator();
 
+                // Wrap everything in a scroll area so the panel is scrollable
+                egui::ScrollArea::vertical().show(ui, |ui| {
+
                 // Connection status
-                let status_color = if registry.connected {
+                let status_color = if params.registry.connected {
                     egui::Color32::GREEN
                 } else {
                     egui::Color32::RED
                 };
                 ui.horizontal(|ui| {
                     ui.colored_label(status_color, "●");
-                    if registry.connected {
+                    if params.registry.connected {
                         // Show truncated URL when connected
-                        let url_display = if daemon_config.http_url.len() > 25 {
-                            format!("{}...", &daemon_config.http_url[..22])
+                        let url_display = if params.daemon_config.http_url.len() > 25 {
+                            format!("{}...", &params.daemon_config.http_url[..22])
                         } else {
-                            daemon_config.http_url.clone()
+                            params.daemon_config.http_url.clone()
                         };
                         ui.label(url_display);
                     } else {
@@ -154,14 +224,14 @@ fn ui_system(
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Connect").clicked() {
-                            connection_dialog.show = true;
+                            params.connection_dialog.show = true;
                             // Pre-fill with current address if we have one
-                            if daemon_config.http_url.starts_with("http://") {
-                                connection_dialog.daemon_address = daemon_config.http_url
+                            if params.daemon_config.http_url.starts_with("http://") {
+                                params.connection_dialog.daemon_address = params.daemon_config.http_url
                                     .trim_start_matches("http://")
                                     .to_string();
-                            } else if daemon_config.http_url.starts_with("https://") {
-                                connection_dialog.daemon_address = daemon_config.http_url
+                            } else if params.daemon_config.http_url.starts_with("https://") {
+                                params.connection_dialog.daemon_address = params.daemon_config.http_url
                                     .trim_start_matches("https://")
                                     .to_string();
                             }
@@ -174,20 +244,20 @@ fn ui_system(
                 egui::CollapsingHeader::new(egui::RichText::new("Discovery").size(14.0 * ui_scale))
                     .default_open(!is_mobile) // Collapsed by default on mobile
                     .show(ui, |ui| {
-                        if network_interfaces.interfaces.is_empty() {
+                        if params.network_interfaces.interfaces.is_empty() {
                             ui.label("Loading interfaces...");
                         } else {
                             // Interface dropdown
-                            let selected_label = network_interfaces.selected_index
-                                .and_then(|i| network_interfaces.interfaces.get(i))
+                            let selected_label = params.network_interfaces.selected_index
+                                .and_then(|i| params.network_interfaces.interfaces.get(i))
                                 .map(|iface| format!("{} ({})", iface.name, iface.ip))
                                 .unwrap_or_else(|| "Select interface".to_string());
 
                             // Collect interface labels to avoid borrow issues
-                            let interface_labels: Vec<_> = network_interfaces.interfaces.iter()
+                            let interface_labels: Vec<_> = params.network_interfaces.interfaces.iter()
                                 .map(|iface| format!("{} ({}/{})", iface.name, iface.subnet, iface.prefix_len))
                                 .collect();
-                            let current_selected = network_interfaces.selected_index;
+                            let current_selected = params.network_interfaces.selected_index;
 
                             let mut new_selected = current_selected;
                             egui::ComboBox::from_label("Interface")
@@ -202,11 +272,11 @@ fn ui_system(
                                         }
                                     }
                                 });
-                            network_interfaces.selected_index = new_selected;
+                            params.network_interfaces.selected_index = new_selected;
 
                             // Show selected subnet info
-                            if let Some(i) = network_interfaces.selected_index {
-                                if let Some(iface) = network_interfaces.interfaces.get(i) {
+                            if let Some(i) = params.network_interfaces.selected_index {
+                                if let Some(iface) = params.network_interfaces.interfaces.get(i) {
                                     ui.label(format!("Subnet: {}/{}", iface.subnet, iface.prefix_len));
 
                                     // Scan button - larger on mobile
@@ -219,8 +289,8 @@ fn ui_system(
                                         egui::Button::new("Scan Network")
                                     };
                                     if ui.add(button).clicked() {
-                                        trigger_scan_on_interface(&subnet, prefix, &daemon_config.http_url);
-                                        network_interfaces.scan_in_progress = true;
+                                        trigger_scan_on_interface(&subnet, prefix, &params.daemon_config.http_url);
+                                        params.network_interfaces.scan_in_progress = true;
                                     }
                                 }
                             }
@@ -228,13 +298,32 @@ fn ui_system(
 
                         // Connection checking checkbox
                         ui.add_space(8.0);
-                        let mut check_connection = heartbeat_state.enabled;
+                        let mut check_connection = params.heartbeat_state.enabled;
                         if ui.checkbox(&mut check_connection, "Check connection").changed() {
-                            heartbeat_state.enabled = check_connection;
-                            toggle_heartbeat(check_connection, &daemon_config.http_url);
+                            params.heartbeat_state.enabled = check_connection;
+                            toggle_heartbeat(check_connection, &params.daemon_config.http_url);
                         }
                         ui.label(
                             egui::RichText::new("Sends ARP pings to check device connectivity")
+                                .size(11.0 * ui_scale)
+                                .color(egui::Color32::GRAY)
+                        );
+
+                        // Firmware checking checkbox
+                        ui.add_space(4.0);
+                        let mut check_firmware = params.firmware_state.enabled;
+                        if ui.checkbox(&mut check_firmware, "Check firmware").changed() {
+                            params.firmware_state.enabled = check_firmware;
+                            if check_firmware {
+                                // Trigger firmware check for all devices
+                                check_all_firmware(&params.daemon_config.http_url, &params.pending_firmware);
+                            } else {
+                                // Clear firmware status when disabled
+                                params.firmware_state.device_status.clear();
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new("Checks for firmware updates (yellow = update available)")
                                 .size(11.0 * ui_scale)
                                 .color(egui::Color32::GRAY)
                         );
@@ -244,22 +333,40 @@ fn ui_system(
 
                 // Device list
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for device in &registry.devices {
-                        let is_selected = selected.0.as_ref() == Some(&device.id);
+                    for device in &params.registry.devices {
+                        let is_selected = params.selected.0.as_ref() == Some(&device.id);
 
-                        // Device name color depends on device status and heartbeat state
-                        // Offline devices always show red (they were seen offline)
-                        // Online devices show white when heartbeat is off (status unknown)
-                        let name_color = match device.status {
-                            DeviceStatus::Offline => egui::Color32::from_rgb(200, 100, 100), // Always red
-                            DeviceStatus::Online => {
-                                if heartbeat_state.enabled {
-                                    egui::Color32::from_rgb(100, 200, 100) // Green when checking
-                                } else {
-                                    egui::Color32::from_rgb(200, 200, 200) // White when not checking
+                        // Device name color depends on device status, firmware status, and heartbeat state
+                        // Priority: Offline (red) > Firmware outdated (yellow) > Online (green/white)
+                        let name_color = if device.status == DeviceStatus::Offline {
+                            egui::Color32::from_rgb(200, 100, 100) // Always red for offline
+                        } else if params.firmware_state.enabled {
+                            // Check firmware status when enabled
+                            match params.firmware_state.device_status.get(&device.id) {
+                                Some(FirmwareStatusData::UpdateAvailable { .. }) => {
+                                    egui::Color32::from_rgb(230, 200, 50) // Yellow for outdated
+                                }
+                                Some(FirmwareStatusData::UpToDate) => {
+                                    egui::Color32::from_rgb(100, 200, 100) // Green for up to date
+                                }
+                                _ => {
+                                    // Unknown or loading - use connection status color
+                                    if params.heartbeat_state.enabled && device.status == DeviceStatus::Online {
+                                        egui::Color32::from_rgb(100, 200, 100) // Green
+                                    } else {
+                                        egui::Color32::from_rgb(200, 200, 200) // White
+                                    }
                                 }
                             }
-                            DeviceStatus::Unknown => egui::Color32::GRAY,
+                        } else {
+                            // Firmware checking disabled - use connection status
+                            if params.heartbeat_state.enabled && device.status == DeviceStatus::Online {
+                                egui::Color32::from_rgb(100, 200, 100) // Green
+                            } else if device.status == DeviceStatus::Unknown {
+                                egui::Color32::GRAY
+                            } else {
+                                egui::Color32::from_rgb(200, 200, 200) // White
+                            }
                         };
 
                         let text = egui::RichText::new(&device.name)
@@ -277,11 +384,11 @@ fn ui_system(
                         };
 
                         if response.clicked() {
-                            selected.0 = Some(device.id.clone());
+                            params.selected.0 = Some(device.id.clone());
                             // On mobile, show the details panel when a device is selected
                             if is_mobile {
-                                ui_layout.show_right_panel = true;
-                                ui_layout.show_left_panel = false;
+                                params.ui_layout.show_right_panel = true;
+                                params.ui_layout.show_left_panel = false;
                             }
                         }
 
@@ -307,7 +414,93 @@ fn ui_system(
 
                 ui.separator();
 
-                ui.label(format!("{} devices", registry.devices.len()));
+                ui.label(format!("{} devices", params.registry.devices.len()));
+
+                ui.separator();
+
+                // HCDF Import/Export - collapsible section
+                egui::CollapsingHeader::new(egui::RichText::new("HCDF Configuration").size(14.0 * ui_scale))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        // Import button
+                        ui.horizontal(|ui| {
+                            let import_button = if is_mobile {
+                                egui::Button::new(egui::RichText::new("Import").size(14.0 * ui_scale))
+                                    .min_size(egui::vec2(0.0, 32.0))
+                            } else {
+                                egui::Button::new("Import")
+                            };
+                            if ui.add(import_button).clicked() {
+                                tracing::warn!("Import button clicked, triggering file picker");
+                                trigger_file_open(
+                                    &params.pending_file_results,
+                                    FilePickerContext::HcdfImport,
+                                    FileFilter::hcdf(),
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new("Load .hcdf file")
+                                    .size(10.0 * ui_scale)
+                                    .color(egui::Color32::GRAY)
+                            );
+                        });
+
+                        ui.add_space(4.0);
+
+                        // Export options
+                        ui.label(egui::RichText::new("Export:").size(12.0 * ui_scale));
+
+                        ui.horizontal(|ui| {
+                            // Save to Server button
+                            let save_server_button = if is_mobile {
+                                egui::Button::new(egui::RichText::new("Save to Server").size(14.0 * ui_scale))
+                                    .min_size(egui::vec2(0.0, 32.0))
+                            } else {
+                                egui::Button::new("Save to Server")
+                            };
+                            if ui.add(save_server_button).clicked() {
+                                save_hcdf_to_server(&params.daemon_config.http_url, None);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("Save to dendrite host filesystem")
+                                .size(10.0 * ui_scale)
+                                .color(egui::Color32::GRAY)
+                        );
+
+                        ui.horizontal(|ui| {
+                            // Download button (browser download)
+                            let download_button = if is_mobile {
+                                egui::Button::new(egui::RichText::new("Download").size(14.0 * ui_scale))
+                                    .min_size(egui::vec2(0.0, 32.0))
+                            } else {
+                                egui::Button::new("Download")
+                            };
+                            if ui.add(download_button).clicked() {
+                                // Fetch HCDF from backend, then trigger browser download
+                                export_hcdf(&params.daemon_config.http_url, &params.pending_hcdf_export);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("Download to this device")
+                                .size(10.0 * ui_scale)
+                                .color(egui::Color32::GRAY)
+                        );
+
+                        // Check if we have pending HCDF export data to save (for browser download)
+                        if let Ok(mut export_data) = params.pending_hcdf_export.0.lock() {
+                            if let Some(content) = export_data.take() {
+                                // Trigger file save with the content
+                                trigger_file_save(
+                                    &params.pending_file_results,
+                                    FilePickerContext::HcdfExport,
+                                    "dendrite_config.hcdf",
+                                    &content,
+                                    "application/xml",
+                                );
+                            }
+                        }
+                    });
 
                 ui.separator();
 
@@ -323,26 +516,26 @@ fn ui_system(
                             egui::Button::new("Reset View")
                         };
                         if ui.add(reset_button).clicked() {
-                            camera_settings.target_focus = Vec3::ZERO;
-                            camera_settings.target_distance = 0.6;
-                            camera_settings.azimuth = 0.8;
-                            camera_settings.elevation = 0.5;
+                            params.camera_settings.target_focus = Vec3::ZERO;
+                            params.camera_settings.target_distance = 0.6;
+                            params.camera_settings.azimuth = 0.8;
+                            params.camera_settings.elevation = 0.5;
                         }
 
                         ui.separator();
 
                         // Grid toggle
-                        ui.checkbox(&mut world_settings.show_grid, "Show Grid");
+                        ui.checkbox(&mut params.world_settings.show_grid, "Show Grid");
 
                         // Axis toggle
-                        ui.checkbox(&mut world_settings.show_axis, "Show World Axis");
+                        ui.checkbox(&mut params.world_settings.show_axis, "Show World Axis");
 
                         ui.separator();
 
                         // Grid spacing control
                         ui.label("Grid Spacing:");
                         ui.add(
-                            egui::DragValue::new(&mut world_settings.grid_spacing)
+                            egui::DragValue::new(&mut params.world_settings.grid_spacing)
                                 .speed(0.01)
                                 .range(0.01..=1.0)
                                 .suffix(" m")
@@ -351,7 +544,7 @@ fn ui_system(
                         // Grid line thickness control
                         ui.label("Line Thickness:");
                         ui.add(
-                            egui::DragValue::new(&mut world_settings.grid_line_thickness)
+                            egui::DragValue::new(&mut params.world_settings.grid_line_thickness)
                                 .speed(0.0001)
                                 .range(0.0001..=0.01)
                                 .suffix(" m")
@@ -360,9 +553,40 @@ fn ui_system(
                         // Grid alpha control
                         ui.label("Grid Opacity:");
                         ui.add(
-                            egui::Slider::new(&mut world_settings.grid_alpha, 0.0..=1.0)
+                            egui::Slider::new(&mut params.world_settings.grid_alpha, 0.0..=1.0)
                         );
                     });
+
+                ui.separator();
+
+                // Topology Graph button
+                let graph_button = if is_mobile {
+                    egui::Button::new(egui::RichText::new("View Topology Graph").size(14.0 * ui_scale))
+                        .min_size(egui::vec2(0.0, 40.0))
+                } else {
+                    egui::Button::new("View Topology Graph")
+                };
+                if ui.add_sized([ui.available_width(), 0.0], graph_button).clicked() {
+                    params.graph_vis.show = true;
+                    // Build topology from current device registry
+                    let nodes: Vec<TopologyNode> = params.registry.devices.iter().map(|d| {
+                        TopologyNode {
+                            id: d.id.clone(),
+                            name: d.name.clone(),
+                            board: d.board.clone(),
+                            is_parent: false, // TODO: detect parent from HCDF
+                            port: d.port,
+                            children: Vec::new(),
+                        }
+                    }).collect();
+                    params.graph_vis.topology = Some(TopologyData {
+                        nodes,
+                        root: None,
+                    });
+                    params.graph_vis.pan_offset = [0.0, 0.0];
+                    params.graph_vis.zoom = 1.0;
+                }
+                }); // End ScrollArea
             });
     }
 
@@ -382,9 +606,9 @@ fn ui_system(
     }
 
     // Selected device details (right side, only if selected)
-    if let Some(id) = selected.0.clone() {
-        if let Some(device) = registry.devices.iter().find(|d| d.id == id) {
-            if !is_mobile || ui_layout.show_right_panel {
+    if let Some(id) = params.selected.0.clone() {
+        if let Some(device) = params.registry.devices.iter().find(|d| d.id == id) {
+            if !is_mobile || params.ui_layout.show_right_panel {
                 egui::SidePanel::right("details_panel")
                     .default_width(if is_mobile { panel_width } else { 300.0 })
                     .resizable(!is_mobile)
@@ -395,7 +619,7 @@ fn ui_system(
                                 ui.heading(egui::RichText::new(&device.name).size(18.0 * ui_scale));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.button(egui::RichText::new("✕").size(18.0 * ui_scale)).clicked() {
-                                        ui_layout.show_right_panel = false;
+                                        params.ui_layout.show_right_panel = false;
                                     }
                                 });
                             });
@@ -420,7 +644,7 @@ fn ui_system(
                                     let status_str = match device.status {
                                         DeviceStatus::Offline => "Offline",
                                         DeviceStatus::Online => {
-                                            if heartbeat_state.enabled {
+                                            if params.heartbeat_state.enabled {
                                                 "Online"
                                             } else {
                                                 "Unknown"
@@ -464,12 +688,159 @@ fn ui_system(
                                     }
                                     ui.end_row();
 
+                                    // Firmware status (when checking is enabled)
+                                    if params.firmware_state.enabled {
+                                        ui.label("Firmware Status:");
+                                        match params.firmware_state.device_status.get(&id) {
+                                            Some(FirmwareStatusData::UpToDate) => {
+                                                ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "Up to date");
+                                            }
+                                            Some(FirmwareStatusData::UpdateAvailable { latest_version, .. }) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(230, 200, 50),
+                                                    format!("Update: {}", latest_version)
+                                                );
+                                            }
+                                            Some(FirmwareStatusData::Unknown) | None => {
+                                                if params.firmware_state.loading.contains(&id) {
+                                                    ui.label("Checking...");
+                                                } else {
+                                                    ui.colored_label(egui::Color32::GRAY, "Unknown");
+                                                }
+                                            }
+                                            Some(FirmwareStatusData::CheckDisabled) => {
+                                                ui.colored_label(egui::Color32::GRAY, "Disabled");
+                                            }
+                                        }
+                                        ui.end_row();
+
+                                        // Show changelog if update available
+                                        if let Some(FirmwareStatusData::UpdateAvailable { changelog: Some(log), .. }) = params.firmware_state.device_status.get(&id) {
+                                            ui.label("Changes:");
+                                            ui.label(log);
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+
+                            // OTA Update section (outside the grid for better button layout)
+                            // Check if there's an active OTA update for this device
+                            if let Some(ota_update) = params.ota_state.device_updates.get(&id).cloned() {
+                                ui.separator();
+                                ui.label("Firmware Update:");
+
+                                // Show progress bar for download/upload phases
+                                if let Some(progress) = ota_update.progress_value() {
+                                    ui.add(egui::ProgressBar::new(progress)
+                                        .text(ota_update.progress_text())
+                                        .animate(true));
+                                } else {
+                                    // Show spinner for other states
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(ota_update.progress_text());
+                                    });
+                                }
+
+                                // Show result coloring for terminal states
+                                match &ota_update {
+                                    OtaUpdateState::Complete => {
+                                        ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "Update complete!");
+                                        // Clear button to dismiss
+                                        if ui.small_button("Dismiss").clicked() {
+                                            params.ota_state.device_updates.remove(&id);
+                                        }
+                                    }
+                                    OtaUpdateState::Failed { error } => {
+                                        ui.colored_label(egui::Color32::from_rgb(200, 100, 100), format!("Failed: {}", error));
+                                        if ui.small_button("Dismiss").clicked() {
+                                            params.ota_state.device_updates.remove(&id);
+                                        }
+                                    }
+                                    OtaUpdateState::Cancelled => {
+                                        ui.colored_label(egui::Color32::GRAY, "Cancelled");
+                                        if ui.small_button("Dismiss").clicked() {
+                                            params.ota_state.device_updates.remove(&id);
+                                        }
+                                    }
+                                    _ => {
+                                        // In-progress states - show cancel button
+                                        let id_clone = id.clone();
+                                        let base_url = params.daemon_config.http_url.clone();
+                                        if ui.button("Cancel Update").clicked() {
+                                            cancel_ota_update(&id_clone, &base_url);
+                                        }
+                                    }
+                                }
+                            } else if params.firmware_state.enabled {
+                                // Show update button if firmware is outdated and no update in progress
+                                if let Some(FirmwareStatusData::UpdateAvailable { .. }) = params.firmware_state.device_status.get(&id) {
+                                    ui.separator();
+                                    let id_clone = id.clone();
+                                    let base_url = params.daemon_config.http_url.clone();
+                                    let update_button = if is_mobile {
+                                        egui::Button::new(
+                                            egui::RichText::new("Update Firmware")
+                                                .size(16.0 * ui_scale)
+                                                .color(egui::Color32::from_rgb(100, 180, 255))
+                                        ).min_size(egui::vec2(0.0, 40.0))
+                                    } else {
+                                        egui::Button::new(
+                                            egui::RichText::new("Update Firmware")
+                                                .color(egui::Color32::from_rgb(100, 180, 255))
+                                        )
+                                    };
+                                    if ui.add(update_button).clicked() {
+                                        start_ota_update(&id_clone, &base_url);
+                                    }
+                                }
+                            }
+
+                            // Always show local firmware upload button (for dev images)
+                            ui.separator();
+                            ui.label(egui::RichText::new("Development").size(12.0 * ui_scale).color(egui::Color32::GRAY));
+                            {
+                                let id_clone = id.clone();
+                                let upload_button = if is_mobile {
+                                    egui::Button::new(
+                                        egui::RichText::new("Upload Local Firmware")
+                                            .size(14.0 * ui_scale)
+                                            .color(egui::Color32::from_rgb(200, 150, 50))
+                                    ).min_size(egui::vec2(0.0, 36.0))
+                                } else {
+                                    egui::Button::new(
+                                        egui::RichText::new("Upload Local Firmware")
+                                            .color(egui::Color32::from_rgb(200, 150, 50))
+                                    )
+                                };
+                                if ui.add(upload_button).clicked() {
+                                    // Open file picker for firmware
+                                    trigger_file_open(
+                                        &params.pending_file_results,
+                                        FilePickerContext::FirmwareUpload { device_id: id_clone },
+                                        FileFilter::firmware(),
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new("Upload .bin/.hex from your computer")
+                                        .size(10.0 * ui_scale)
+                                        .color(egui::Color32::GRAY)
+                                );
+                            }
+
+                            ui.separator();
+
+                            // Continue with position editing (re-enter grid)
+                            egui::Grid::new("device_grid_pos")
+                                .num_columns(2)
+                                .spacing([10.0, 4.0 * ui_scale])
+                                .show(ui, |ui| {
                                     // Editable Position (ENU)
                                     ui.label("Position (ENU):");
                                     ui.label("");
                                     ui.end_row();
 
-                                    let current_pos = positions.positions.get(&id).cloned().unwrap_or(Vec3::ZERO);
+                                    let current_pos = params.positions.positions.get(&id).cloned().unwrap_or(Vec3::ZERO);
 
                                     // Editable X field
                                     ui.label("  X (East):");
@@ -506,27 +877,36 @@ fn ui_system(
                                         let new_pos = Vec3::new(x_val, y_val, z_val);
 
                                         // Update stored position
-                                        positions.positions.insert(id.clone(), new_pos);
+                                        params.positions.positions.insert(id.clone(), new_pos);
 
                                         // Update the device's transform
-                                        for (device, mut transform) in device_query.iter_mut() {
+                                        for (device, mut transform) in params.device_query.iter_mut() {
                                             if device.device_id == id {
                                                 transform.translation = new_pos;
                                                 break;
                                             }
                                         }
+
+                                        // Sync position to backend (updates HCDF)
+                                        let orient = params.orientations.orientations.get(&id).cloned().unwrap_or(Vec3::ZERO);
+                                        update_device_position(
+                                            &id,
+                                            [new_pos.x, new_pos.y, new_pos.z],
+                                            Some([orient.x, orient.y, orient.z]),
+                                            &params.daemon_config.http_url,
+                                        );
                                     }
 
                                     // Show rotation axis checkbox (unchecked by default)
                                     ui.label("Show Rotation Axis:");
-                                    if ui.checkbox(&mut show_rotation_axis.0, "").changed() {
+                                    if ui.checkbox(&mut params.show_rotation_axis.0, "").changed() {
                                         // Value already updated by checkbox
                                     }
                                     ui.end_row();
 
                                     // Show orientation from 3D scene
                                     // Get stored Euler angles (these are display values, not used to compute rotation)
-                                    let orient = orientations.orientations.get(&id).cloned().unwrap_or(Vec3::ZERO);
+                                    let orient = params.orientations.orientations.get(&id).cloned().unwrap_or(Vec3::ZERO);
 
                                     ui.label("Orientation (FLU):");
                                     ui.label("");
@@ -577,8 +957,8 @@ fn ui_system(
                                     };
 
                                     // Only update if changed to trigger change detection
-                                    if active_rotation_field.axis != new_axis {
-                                        active_rotation_field.axis = new_axis;
+                                    if params.active_rotation_field.axis != new_axis {
+                                        params.active_rotation_field.axis = new_axis;
                                     }
 
                                     // Apply Euler XYZ rotation
@@ -588,13 +968,13 @@ fn ui_system(
                                         let yaw_rad = yaw_deg.to_radians();
 
                                         // Store the Euler angles
-                                        orientations.orientations.insert(
+                                        params.orientations.orientations.insert(
                                             id.clone(),
                                             Vec3::new(roll_rad, pitch_rad, yaw_rad)
                                         );
 
                                         // Update the device's rotation quaternion using XYZ Euler order
-                                        for (device, mut transform) in device_query.iter_mut() {
+                                        for (device, mut transform) in params.device_query.iter_mut() {
                                             if device.device_id == id {
                                                 transform.rotation = Quat::from_euler(
                                                     EulerRot::XYZ,
@@ -605,6 +985,15 @@ fn ui_system(
                                                 break;
                                             }
                                         }
+
+                                        // Sync orientation to backend (updates HCDF)
+                                        let pos = params.positions.positions.get(&id).cloned().unwrap_or(Vec3::ZERO);
+                                        update_device_position(
+                                            &id,
+                                            [pos.x, pos.y, pos.z],
+                                            Some([roll_rad, pitch_rad, yaw_rad]),
+                                            &params.daemon_config.http_url,
+                                        );
                                     }
                                 });
 
@@ -615,9 +1004,9 @@ fn ui_system(
                             let frame_count = device.frames.len();
                             let sensor_count = device.sensors.len();
                             if frame_count > 0 || sensor_count > 0 {
-                                let mut show_frames = frame_visibility.show_frames_for(&id);
+                                let mut show_frames = params.frame_visibility.show_frames_for(&id);
                                 if ui.checkbox(&mut show_frames, "Show Reference Frames").changed() {
-                                    frame_visibility.set_show_frames(&id, show_frames);
+                                    params.frame_visibility.set_show_frames(&id, show_frames);
                                 }
                                 // Build description showing both frame and sensor counts
                                 let description = match (frame_count, sensor_count) {
@@ -646,9 +1035,9 @@ fn ui_system(
                                                 );
                                                 for frame in &device.frames {
                                                     ui.horizontal(|ui| {
-                                                        let mut frame_vis = frame_visibility.is_frame_visible(&id, &frame.name);
+                                                        let mut frame_vis = params.frame_visibility.is_frame_visible(&id, &frame.name);
                                                         if ui.checkbox(&mut frame_vis, "").changed() {
-                                                            frame_visibility.set_frame_visible(&id, &frame.name, frame_vis);
+                                                            params.frame_visibility.set_frame_visible(&id, &frame.name, frame_vis);
                                                         }
                                                         ui.label(
                                                             egui::RichText::new(&frame.name)
@@ -682,7 +1071,7 @@ fn ui_system(
                                                 let mut any_sensor_hovered_in_frames = false;
                                                 for sensor in &device.sensors {
                                                     let sensor_key = format!("{}:{}", id, sensor.name);
-                                                    let is_hovered = frame_visibility.hovered_sensor_from_ui.as_ref() == Some(&sensor_key);
+                                                    let is_hovered = params.frame_visibility.hovered_sensor_from_ui.as_ref() == Some(&sensor_key);
 
                                                     // Highlight color when hovered
                                                     let name_color = if is_hovered {
@@ -692,9 +1081,9 @@ fn ui_system(
                                                     };
 
                                                     ui.horizontal(|ui| {
-                                                        let mut axis_vis = frame_visibility.is_sensor_axis_visible(&id, &sensor.name);
+                                                        let mut axis_vis = params.frame_visibility.is_sensor_axis_visible(&id, &sensor.name);
                                                         if ui.checkbox(&mut axis_vis, "").changed() {
-                                                            frame_visibility.set_sensor_axis_visible(&id, &sensor.name, axis_vis);
+                                                            params.frame_visibility.set_sensor_axis_visible(&id, &sensor.name, axis_vis);
                                                         }
 
                                                         // Use selectable_label for hover detection
@@ -707,7 +1096,7 @@ fn ui_system(
 
                                                         // Track hover state
                                                         if response.hovered() {
-                                                            frame_visibility.hovered_sensor_from_ui = Some(sensor_key);
+                                                            params.frame_visibility.hovered_sensor_from_ui = Some(sensor_key);
                                                             any_sensor_hovered_in_frames = true;
                                                         }
                                                     });
@@ -715,9 +1104,9 @@ fn ui_system(
 
                                                 // Clear hover if no sensor in this device's frame section is hovered
                                                 if !any_sensor_hovered_in_frames {
-                                                    if let Some(ref hovered) = frame_visibility.hovered_sensor_from_ui.clone() {
+                                                    if let Some(ref hovered) = params.frame_visibility.hovered_sensor_from_ui.clone() {
                                                         if hovered.starts_with(&format!("{}:", id)) {
-                                                            frame_visibility.hovered_sensor_from_ui = None;
+                                                            params.frame_visibility.hovered_sensor_from_ui = None;
                                                         }
                                                     }
                                                 }
@@ -737,9 +1126,9 @@ fn ui_system(
 
                                 // Show Sensors checkbox controls FOV visualization
                                 if fov_sensor_count > 0 {
-                                    let mut show_sensors = frame_visibility.show_sensors_for(&id);
+                                    let mut show_sensors = params.frame_visibility.show_sensors_for(&id);
                                     if ui.checkbox(&mut show_sensors, "Show Sensors").changed() {
-                                        frame_visibility.set_show_sensors(&id, show_sensors);
+                                        params.frame_visibility.set_show_sensors(&id, show_sensors);
                                     }
                                     ui.label(
                                         egui::RichText::new(format!("{} sensor(s) with FOV", fov_sensor_count))
@@ -761,7 +1150,7 @@ fn ui_system(
                                         let mut any_sensor_hovered = false;
                                         for sensor in &device.sensors {
                                             let sensor_key = format!("{}:{}", id, sensor.name);
-                                            let is_hovered = frame_visibility.hovered_sensor_from_ui.as_ref() == Some(&sensor_key);
+                                            let is_hovered = params.frame_visibility.hovered_sensor_from_ui.as_ref() == Some(&sensor_key);
                                             let has_fov = sensor.geometry.is_some() || !sensor.fovs.is_empty();
                                             // Highlight color when hovered
                                             let name_color = if is_hovered {
@@ -789,7 +1178,7 @@ fn ui_system(
 
                                             // Track hover state
                                             if response.hovered() {
-                                                frame_visibility.hovered_sensor_from_ui = Some(sensor_key);
+                                                params.frame_visibility.hovered_sensor_from_ui = Some(sensor_key);
                                                 any_sensor_hovered = true;
                                             }
                                             ui.indent("sensor_detail", |ui| {
@@ -808,9 +1197,9 @@ fn ui_system(
                                                 // Per-sensor FOV visibility toggle (only for sensors with FOV)
                                                 if has_fov {
                                                     ui.horizontal(|ui| {
-                                                        let mut show_fov = frame_visibility.is_sensor_fov_visible(&id, &sensor.name);
+                                                        let mut show_fov = params.frame_visibility.is_sensor_fov_visible(&id, &sensor.name);
                                                         if ui.checkbox(&mut show_fov, "").changed() {
-                                                            frame_visibility.set_sensor_fov_visible(&id, &sensor.name, show_fov);
+                                                            params.frame_visibility.set_sensor_fov_visible(&id, &sensor.name, show_fov);
                                                         }
                                                         ui.label(
                                                             egui::RichText::new("Show FOV")
@@ -852,9 +1241,9 @@ fn ui_system(
                                                 // Axis alignment toggle (only for sensors with axis_align)
                                                 if let Some(ref axis_align) = sensor.axis_align {
                                                     ui.horizontal(|ui| {
-                                                        let mut show_aligned = frame_visibility.is_sensor_axis_aligned(&id, &sensor.name);
+                                                        let mut show_aligned = params.frame_visibility.is_sensor_axis_aligned(&id, &sensor.name);
                                                         if ui.checkbox(&mut show_aligned, "").changed() {
-                                                            frame_visibility.set_sensor_axis_aligned(&id, &sensor.name, show_aligned);
+                                                            params.frame_visibility.set_sensor_axis_aligned(&id, &sensor.name, show_aligned);
                                                         }
                                                         let label_text = if show_aligned {
                                                             format!("Aligned: X={} Y={} Z={}", axis_align.x, axis_align.y, axis_align.z)
@@ -873,9 +1262,9 @@ fn ui_system(
 
                                         // Clear hover if no sensor in this device is hovered
                                         if !any_sensor_hovered {
-                                            if let Some(ref hovered) = frame_visibility.hovered_sensor_from_ui.clone() {
+                                            if let Some(ref hovered) = params.frame_visibility.hovered_sensor_from_ui.clone() {
                                                 if hovered.starts_with(&format!("{}:", id)) {
-                                                    frame_visibility.hovered_sensor_from_ui = None;
+                                                    params.frame_visibility.hovered_sensor_from_ui = None;
                                                 }
                                             }
                                         }
@@ -885,9 +1274,9 @@ fn ui_system(
 
                             // Per-device port visibility toggle (only if device has ports)
                             if !device.ports.is_empty() {
-                                let mut show_ports = frame_visibility.show_ports_for(&id);
+                                let mut show_ports = params.frame_visibility.show_ports_for(&id);
                                 if ui.checkbox(&mut show_ports, "Show Ports").changed() {
-                                    frame_visibility.set_show_ports(&id, show_ports);
+                                    params.frame_visibility.set_show_ports(&id, show_ports);
                                 }
                                 ui.label(
                                     egui::RichText::new(format!("{} port(s)", device.ports.len()))
@@ -901,7 +1290,7 @@ fn ui_system(
                                     ui.indent("ports", |ui| {
                                         for port in &device.ports {
                                             let port_key = format!("{}:{}", id, port.name);
-                                            let is_hovered = frame_visibility.hovered_port.as_ref() == Some(&port_key);
+                                            let is_hovered = params.frame_visibility.hovered_port.as_ref() == Some(&port_key);
                                             let port_color = match port.port_type.to_lowercase().as_str() {
                                                 "ethernet" => egui::Color32::from_rgb(50, 200, 50),
                                                 "can" => egui::Color32::from_rgb(255, 200, 50),
@@ -931,8 +1320,8 @@ fn ui_system(
 
                                             // Set hovered_port when hovering over port name in UI
                                             if response.hovered() {
-                                                frame_visibility.hovered_port = Some(port_key);
-                                                frame_visibility.hovered_port_from_ui = true;
+                                                params.frame_visibility.hovered_port = Some(port_key);
+                                                params.frame_visibility.hovered_port_from_ui = true;
                                                 any_port_hovered = true;
                                             }
                                         }
@@ -942,11 +1331,11 @@ fn ui_system(
                                     // 1. No port in this UI list is hovered, AND
                                     // 2. The hover was set by UI (not 3D), AND
                                     // 3. The currently hovered port belongs to this device
-                                    if !any_port_hovered && frame_visibility.hovered_port_from_ui {
-                                        if let Some(ref hovered) = frame_visibility.hovered_port.clone() {
+                                    if !any_port_hovered && params.frame_visibility.hovered_port_from_ui {
+                                        if let Some(ref hovered) = params.frame_visibility.hovered_port.clone() {
                                             if hovered.starts_with(&format!("{}:", id)) {
-                                                frame_visibility.hovered_port = None;
-                                                frame_visibility.hovered_port_from_ui = false;
+                                                params.frame_visibility.hovered_port = None;
+                                                params.frame_visibility.hovered_port_from_ui = false;
                                             }
                                         }
                                     }
@@ -960,9 +1349,9 @@ fn ui_system(
                                 for toggle_group in &toggle_groups {
                                     // Format label as "Hide {group}" with capitalized group name
                                     let label = format!("Hide {}", capitalize_first(toggle_group));
-                                    let mut is_hidden = frame_visibility.is_toggle_hidden(&id, toggle_group);
+                                    let mut is_hidden = params.frame_visibility.is_toggle_hidden(&id, toggle_group);
                                     if ui.checkbox(&mut is_hidden, &label).changed() {
-                                        frame_visibility.set_toggle_hidden(&id, toggle_group, is_hidden);
+                                        params.frame_visibility.set_toggle_hidden(&id, toggle_group, is_hidden);
                                     }
                                 }
                                 ui.separator();
@@ -989,9 +1378,9 @@ fn ui_system(
                                     egui::Button::new("Remove Device")
                                 };
                                 if ui.add(remove_button).clicked() {
-                                    crate::network::remove_device(&device.id, &daemon_config.http_url);
-                                    selected.0 = None;
-                                    ui_layout.show_right_panel = false;
+                                    crate::network::remove_device(&device.id, &params.daemon_config.http_url);
+                                    params.selected.0 = None;
+                                    params.ui_layout.show_right_panel = false;
                                 }
                                 ui.separator();
                             }
@@ -1003,8 +1392,8 @@ fn ui_system(
                                 egui::Button::new("Close")
                             };
                             if ui.add(close_button).clicked() {
-                                selected.0 = None;
-                                ui_layout.show_right_panel = false;
+                                params.selected.0 = None;
+                                params.ui_layout.show_right_panel = false;
                             }
                         });
                     });
@@ -1013,7 +1402,7 @@ fn ui_system(
     }
 
     // Connection dialog modal
-    if connection_dialog.show {
+    if params.connection_dialog.show {
         egui::Window::new("Connect to Daemon")
             .collapsible(false)
             .resizable(false)
@@ -1026,40 +1415,40 @@ fn ui_system(
 
                 // Address input
                 let response = ui.add(
-                    egui::TextEdit::singleline(&mut connection_dialog.daemon_address)
+                    egui::TextEdit::singleline(&mut params.connection_dialog.daemon_address)
                         .hint_text("e.g., 192.168.1.100:8080")
                         .desired_width(280.0)
                 );
 
                 // Show error if any
-                if let Some(error) = &connection_dialog.error {
+                if let Some(error) = &params.connection_dialog.error {
                     ui.colored_label(egui::Color32::RED, error);
                 }
 
                 ui.add_space(8.0);
 
                 // Show current connection info
-                ui.label(format!("Current: {}", daemon_config.http_url));
+                ui.label(format!("Current: {}", params.daemon_config.http_url));
 
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        let addr = connection_dialog.daemon_address.trim();
+                        let addr = params.connection_dialog.daemon_address.trim();
                         if !addr.is_empty() {
-                            reconnect_events.write(ReconnectEvent {
+                            params.reconnect_events.write(ReconnectEvent {
                                 daemon_address: addr.to_string(),
                             });
-                            connection_dialog.show = false;
-                            connection_dialog.error = None;
+                            params.connection_dialog.show = false;
+                            params.connection_dialog.error = None;
                         } else {
-                            connection_dialog.error = Some("Please enter a daemon address".to_string());
+                            params.connection_dialog.error = Some("Please enter a daemon address".to_string());
                         }
                     }
 
                     if ui.button("Cancel").clicked() {
-                        connection_dialog.show = false;
-                        connection_dialog.error = None;
+                        params.connection_dialog.show = false;
+                        params.connection_dialog.error = None;
                     }
                 });
 
@@ -1070,6 +1459,206 @@ fn ui_system(
                 // Help text
                 ui.label("Tip: You can also use URL parameters:");
                 ui.label("?daemon=192.168.1.100:8080");
+            });
+    }
+
+    // Graph visualization overlay
+    if params.graph_vis.show {
+        let screen_rect = ctx.screen_rect();
+        let window_size = egui::vec2(
+            (screen_rect.width() * 0.85).min(900.0),
+            (screen_rect.height() * 0.85).min(700.0),
+        );
+
+        egui::Window::new("Device Topology Graph")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(window_size)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                // Header with close button and controls
+                ui.horizontal(|ui| {
+                    ui.heading("Network Topology");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            params.graph_vis.show = false;
+                        }
+                        ui.separator();
+                        // Zoom controls
+                        if ui.button("-").clicked() {
+                            params.graph_vis.zoom = (params.graph_vis.zoom - 0.1).max(0.3);
+                        }
+                        ui.label(format!("{:.0}%", params.graph_vis.zoom * 100.0));
+                        if ui.button("+").clicked() {
+                            params.graph_vis.zoom = (params.graph_vis.zoom + 0.1).min(3.0);
+                        }
+                        ui.separator();
+                        if ui.button("Reset View").clicked() {
+                            params.graph_vis.pan_offset = [0.0, 0.0];
+                            params.graph_vis.zoom = 1.0;
+                        }
+                    });
+                });
+
+                ui.separator();
+
+                // Graph canvas area
+                let available = ui.available_size();
+                let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
+
+                // Handle panning
+                if response.dragged() {
+                    let delta = response.drag_delta();
+                    params.graph_vis.pan_offset[0] += delta.x;
+                    params.graph_vis.pan_offset[1] += delta.y;
+                }
+
+                // Handle scrolling for zoom
+                let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll_delta != 0.0 {
+                    let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
+                    params.graph_vis.zoom = (params.graph_vis.zoom * zoom_factor).clamp(0.3, 3.0);
+                }
+
+                // Background
+                let rect = response.rect;
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 25, 35));
+
+                // Draw the topology graph
+                // Clone topology to avoid borrow conflicts when updating hover/selection state
+                let topology_clone = params.graph_vis.topology.clone();
+                if let Some(topology) = topology_clone {
+                    let zoom = params.graph_vis.zoom;
+                    let pan = params.graph_vis.pan_offset;
+                    let center = rect.center();
+
+                    // Calculate node positions in a radial layout
+                    let node_count = topology.nodes.len();
+                    let radius = 150.0 * zoom;
+
+                    // Track hover/click state changes to apply after rendering
+                    let mut new_hovered: Option<String> = None;
+                    let mut clicked_node: Option<String> = None;
+
+                    // Draw connections and nodes
+                    for (i, node) in topology.nodes.iter().enumerate() {
+                        let angle = (i as f32 / node_count.max(1) as f32) * std::f32::consts::TAU;
+                        let node_x = center.x + pan[0] + radius * angle.cos();
+                        let node_y = center.y + pan[1] + radius * angle.sin();
+                        let node_pos = egui::pos2(node_x, node_y);
+
+                        // Draw connections to children
+                        for child_id in &node.children {
+                            if let Some((j, _)) = topology.nodes.iter().enumerate().find(|(_, n)| &n.id == child_id) {
+                                let child_angle = (j as f32 / node_count.max(1) as f32) * std::f32::consts::TAU;
+                                let child_x = center.x + pan[0] + radius * child_angle.cos();
+                                let child_y = center.y + pan[1] + radius * child_angle.sin();
+                                let child_pos = egui::pos2(child_x, child_y);
+
+                                painter.line_segment(
+                                    [node_pos, child_pos],
+                                    egui::Stroke::new(2.0 * zoom, egui::Color32::from_rgb(100, 150, 200)),
+                                );
+                            }
+                        }
+
+                        // Draw node circle
+                        let node_radius = 30.0 * zoom;
+                        let is_hovered = params.graph_vis.hovered_node.as_ref() == Some(&node.id);
+                        let is_selected = params.selected.0.as_ref() == Some(&node.id);
+
+                        let fill_color = if is_selected {
+                            egui::Color32::from_rgb(80, 180, 255)
+                        } else if node.is_parent {
+                            egui::Color32::from_rgb(255, 180, 80)
+                        } else {
+                            egui::Color32::from_rgb(60, 140, 200)
+                        };
+
+                        let stroke_color = if is_hovered {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::from_rgb(150, 180, 210)
+                        };
+
+                        painter.circle(
+                            node_pos,
+                            node_radius,
+                            fill_color,
+                            egui::Stroke::new(if is_hovered { 3.0 } else { 1.5 }, stroke_color),
+                        );
+
+                        // Draw node label
+                        let font_size = 12.0 * zoom;
+                        let text_color = egui::Color32::WHITE;
+
+                        // Node name
+                        painter.text(
+                            node_pos,
+                            egui::Align2::CENTER_CENTER,
+                            &node.name,
+                            egui::FontId::proportional(font_size),
+                            text_color,
+                        );
+
+                        // Board type below
+                        if let Some(ref board) = node.board {
+                            painter.text(
+                                egui::pos2(node_pos.x, node_pos.y + node_radius + 8.0 * zoom),
+                                egui::Align2::CENTER_TOP,
+                                board,
+                                egui::FontId::proportional(font_size * 0.8),
+                                egui::Color32::from_rgb(150, 160, 180),
+                            );
+                        }
+
+                        // Port number if available
+                        if let Some(port) = node.port {
+                            painter.text(
+                                egui::pos2(node_pos.x, node_pos.y - node_radius - 5.0 * zoom),
+                                egui::Align2::CENTER_BOTTOM,
+                                format!("Port {}", port),
+                                egui::FontId::proportional(font_size * 0.7),
+                                egui::Color32::from_rgb(180, 180, 100),
+                            );
+                        }
+
+                        // Check for hover/click
+                        let node_rect = egui::Rect::from_center_size(node_pos, egui::vec2(node_radius * 2.0, node_radius * 2.0));
+                        if let Some(pointer_pos) = response.hover_pos() {
+                            if node_rect.contains(pointer_pos) {
+                                new_hovered = Some(node.id.clone());
+
+                                // Click to select
+                                if response.clicked() {
+                                    clicked_node = Some(node.id.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    // Apply state changes after iteration
+                    params.graph_vis.hovered_node = new_hovered;
+                    if let Some(node_id) = clicked_node {
+                        params.selected.0 = Some(node_id);
+                        params.graph_vis.show = false; // Close graph and show device details
+                    }
+                } else {
+                    // No topology data
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "No devices discovered",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::GRAY,
+                    );
+                }
+
+                // Instructions at bottom
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Drag to pan | Scroll to zoom | Click node to select").small().color(egui::Color32::GRAY));
+                });
             });
     }
 }
