@@ -226,10 +226,15 @@ impl AppState {
             }
         }
 
-        // Update HCDF
-        {
+        // Update HCDF - but skip for comp-derived scene objects (they're already in hcdf.comp)
+        // Comp-derived devices have IDs like "comp-rtk-gnss-assembly" or "hwid:comp-..."
+        let is_comp_derived = device.id.as_str().starts_with("comp-")
+            || device.id.as_str().starts_with("hwid:comp-");
+        if !is_comp_derived {
             let mut hcdf = self.hcdf.write().await;
             hcdf.upsert_device(&device, parent_name);
+        } else {
+            debug!(device = %device.id, "Skipping HCDF upsert for comp-derived device");
         }
 
         // Rebuild topology

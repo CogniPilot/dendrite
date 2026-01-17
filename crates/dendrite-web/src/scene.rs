@@ -8,7 +8,7 @@ use bevy::camera::primitives::MeshAabb;  // Trait for compute_aabb
 use bevy_egui::{egui, EguiContexts};
 use bevy_picking::prelude::{Click, Out, Over, Pointer, PointerButton};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FirmwareCheckState, FirmwareStatusData, FrameVisibility, SelectedDevice, ShowRotationAxis, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FirmwareCheckState, FirmwareStatusData, FrameVisibility, SelectedDevice, ShowRotationAxis, UiLayout, WorldSettings};
 use crate::models::{ExcludeFromBounds, PortEntity, PortMeshTarget, SensorAxisEntity, SensorFovEntity};
 use crate::network::HeartbeatState;
 
@@ -38,10 +38,14 @@ impl Plugin for ScenePlugin {
             .add_observer(on_frame_gizmo_out)
             .add_observer(on_sensor_axis_over)
             .add_observer(on_sensor_axis_out)
+            .add_observer(on_sensor_axis_click)
             .add_observer(on_sensor_fov_over)
             .add_observer(on_sensor_fov_out)
+            .add_observer(on_sensor_fov_click)
+            .add_observer(on_frame_gizmo_click)
             .add_observer(on_port_over)
-            .add_observer(on_port_out);
+            .add_observer(on_port_out)
+            .add_observer(on_port_click);
     }
 }
 
@@ -373,9 +377,34 @@ fn update_camera(
     touch_input: Res<Touches>,
     time: Res<Time>,
     mut contexts: EguiContexts,
+    mut ui_layout: ResMut<UiLayout>,
 ) {
     // Check if egui wants the pointer - bevy_egui/picking handles this via the unified picking system
     let egui_wants_pointer = contexts.ctx_mut().map(|ctx| ctx.wants_pointer_input()).unwrap_or(false);
+
+    // On mobile, hide panels when touching the canvas (not UI panels)
+    // We check touch position to ensure it's not in the panel area
+    if ui_layout.is_mobile && touch_input.iter().count() > 0 && !egui_wants_pointer {
+        let panel_width = ui_layout.panel_width();
+
+        for touch in touch_input.iter() {
+            // Only trigger on new touches (small or zero delta indicates touch just started)
+            if touch.delta().length() < 2.0 {
+                let pos = touch.position();
+                // Check if touch is NOT in left panel area, right panel area, or bottom toolbar
+                let in_left_panel = ui_layout.show_left_panel && pos.x < panel_width;
+                let in_right_panel = ui_layout.show_right_panel && pos.x > (ui_layout.screen_width - panel_width);
+                let in_bottom_toolbar = pos.y > (ui_layout.screen_height - 50.0); // Bottom toolbar area
+
+                // Only hide if touch is in the canvas area (not in any UI region)
+                if !in_left_panel && !in_right_panel && !in_bottom_toolbar {
+                    ui_layout.show_left_panel = false;
+                    ui_layout.show_right_panel = false;
+                    break;
+                }
+            }
+        }
+    }
 
     // Collect mouse motion delta
     let total_motion: Vec2 = mouse_motion.read().map(|m| m.delta).sum();
@@ -428,14 +457,32 @@ fn update_camera(
         }
     }
 
-    // Pinch to zoom
-    if touch_input.iter().count() == 2 {
+    // Two-finger gestures: pinch to zoom AND drag to pan
+    if touch_input.iter().count() == 2 && !egui_wants_pointer {
         let touches: Vec<_> = touch_input.iter().collect();
         if let (Some(t1), Some(t2)) = (touches.get(0), touches.get(1)) {
+            // Pinch to zoom (distance change between fingers)
             let curr_dist = t1.position().distance(t2.position());
             let prev_dist = (t1.position() - t1.delta()).distance(t2.position() - t2.delta());
             let zoom_factor = prev_dist / curr_dist.max(1.0);
             settings.target_distance = (settings.target_distance * zoom_factor).clamp(0.05, 5.0);
+
+            // Two-finger drag to pan (average movement of both fingers)
+            let avg_delta = (t1.delta() + t2.delta()) / 2.0;
+            if avg_delta.length() > 0.5 {
+                // Calculate camera right and up vectors for panning
+                let forward = Vec3::new(
+                    settings.azimuth.cos() * settings.elevation.cos(),
+                    settings.azimuth.sin() * settings.elevation.cos(),
+                    settings.elevation.sin(),
+                );
+                let right = Vec3::new(-settings.azimuth.sin(), settings.azimuth.cos(), 0.0);
+                let up = forward.cross(right).normalize();
+
+                let pan_speed = settings.distance * 0.002;
+                settings.target_focus -= right * avg_delta.x * pan_speed;
+                settings.target_focus += up * avg_delta.y * pan_speed;
+            }
         }
     }
 
@@ -1484,9 +1531,41 @@ fn on_frame_gizmo_out(
 ) {
     let entity = trigger.event().entity;
 
-    // Only clear if this is actually a frame gizmo
-    if frame_query.get(entity).is_ok() {
+    // Only clear if this is actually a frame gizmo AND not from a click (touch sticky)
+    if frame_query.get(entity).is_ok() && !frame_visibility.hovered_frame_from_click {
         frame_visibility.hovered_frame = None;
+    }
+}
+
+/// Observer: Handle click/tap on a frame gizmo (for touch-friendly sticky selection)
+fn on_frame_gizmo_click(
+    trigger: On<Pointer<Click>>,
+    frame_query: Query<&FrameGizmo>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let event = trigger.event();
+    if event.button != PointerButton::Primary {
+        return;
+    }
+
+    let entity = event.entity;
+    if let Ok(gizmo) = frame_query.get(entity) {
+        let frame_key = format!("{}:{}", gizmo.device_id, gizmo.frame_name);
+        // Toggle: if clicking the same frame, deselect; otherwise select new one
+        if frame_visibility.hovered_frame.as_ref() == Some(&frame_key) && frame_visibility.hovered_frame_from_click {
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+        } else {
+            frame_visibility.hovered_frame = Some(frame_key);
+            frame_visibility.hovered_frame_from_click = true;
+            // Clear other sticky selections
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+            frame_visibility.hovered_port = None;
+            frame_visibility.hovered_port_from_ui = false;
+        }
     }
 }
 
@@ -1495,6 +1574,7 @@ fn render_frame_tooltip(
     mut contexts: EguiContexts,
     frame_visibility: Res<FrameVisibility>,
     frame_query: Query<&FrameGizmo>,
+    ui_layout: Res<UiLayout>,
 ) {
     // Only show tooltip if a frame is hovered
     let Some(ref hovered_key) = frame_visibility.hovered_frame else {
@@ -1521,21 +1601,48 @@ fn render_frame_tooltip(
     // Get the egui context
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
-    // Show tooltip at cursor position
-    if let Some(pos) = ctx.pointer_hover_pos() {
-        egui::Area::new(egui::Id::new("frame_tooltip"))
-            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
-            .order(egui::Order::Tooltip)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .show(ui, |ui| {
-                        ui.set_min_width(120.0);
-                        ui.label(egui::RichText::new(&frame_name).strong());
-                        if !description.is_empty() {
-                            ui.label(&description);
-                        }
-                    });
-            });
+    // On mobile/touch, show tooltip as a card at top of screen to avoid finger occlusion
+    // On desktop, show at cursor position
+    let tooltip_pos = if ui_layout.is_mobile {
+        // Center horizontally at top of screen with some padding
+        egui::pos2(ui_layout.screen_width / 2.0 - 80.0, 60.0)
+    } else if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::pos2(pos.x + 15.0, pos.y + 15.0)
+    } else {
+        return;
+    };
+
+    egui::Area::new(egui::Id::new("frame_tooltip"))
+        .fixed_pos(tooltip_pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_min_width(120.0);
+                    ui.label(egui::RichText::new(&frame_name).strong());
+                    if !description.is_empty() {
+                        ui.label(&description);
+                    }
+                });
+        });
+}
+
+/// Helper to find SensorAxisEntity by walking up the entity hierarchy
+fn find_sensor_axis_in_hierarchy<'a>(
+    entity: Entity,
+    sensor_query: &'a Query<&SensorAxisEntity>,
+    parent_query: &Query<&ChildOf>,
+) -> Option<&'a SensorAxisEntity> {
+    let mut current = entity;
+    loop {
+        if let Ok(sensor_axis) = sensor_query.get(current) {
+            return Some(sensor_axis);
+        }
+        if let Ok(child_of) = parent_query.get(current) {
+            current = child_of.parent();
+        } else {
+            return None;
+        }
     }
 }
 
@@ -1543,13 +1650,17 @@ fn render_frame_tooltip(
 fn on_sensor_axis_over(
     trigger: On<Pointer<Over>>,
     sensor_query: Query<&SensorAxisEntity>,
+    parent_query: Query<&ChildOf>,
     mut frame_visibility: ResMut<FrameVisibility>,
 ) {
     let entity = trigger.event().entity;
 
-    if let Ok(sensor_axis) = sensor_query.get(entity) {
+    if let Some(sensor_axis) = find_sensor_axis_in_hierarchy(entity, &sensor_query, &parent_query) {
         let sensor_key = format!("{}:{}", sensor_axis.device_id, sensor_axis.sensor_name);
-        frame_visibility.hovered_sensor_axis = Some(sensor_key);
+        // Don't overwrite sticky selection from a click
+        if !frame_visibility.hovered_sensor_axis_from_click {
+            frame_visibility.hovered_sensor_axis = Some(sensor_key);
+        }
     }
 }
 
@@ -1557,12 +1668,50 @@ fn on_sensor_axis_over(
 fn on_sensor_axis_out(
     trigger: On<Pointer<Out>>,
     sensor_query: Query<&SensorAxisEntity>,
+    parent_query: Query<&ChildOf>,
     mut frame_visibility: ResMut<FrameVisibility>,
 ) {
     let entity = trigger.event().entity;
 
-    if sensor_query.get(entity).is_ok() {
+    // Only clear if this is a sensor axis and not from a click (touch sticky)
+    if find_sensor_axis_in_hierarchy(entity, &sensor_query, &parent_query).is_some()
+        && !frame_visibility.hovered_sensor_axis_from_click
+    {
         frame_visibility.hovered_sensor_axis = None;
+    }
+}
+
+/// Observer: Handle click/tap on a sensor axis (for touch-friendly sticky selection)
+fn on_sensor_axis_click(
+    trigger: On<Pointer<Click>>,
+    sensor_query: Query<&SensorAxisEntity>,
+    parent_query: Query<&ChildOf>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let event = trigger.event();
+    if event.button != PointerButton::Primary {
+        return;
+    }
+
+    let entity = event.entity;
+    if let Some(sensor_axis) = find_sensor_axis_in_hierarchy(entity, &sensor_query, &parent_query) {
+        let sensor_key = format!("{}:{}", sensor_axis.device_id, sensor_axis.sensor_name);
+        // Toggle: only deselect if this was already a sticky selection (from a previous click)
+        // This prevents the Over event from causing immediate deselection on first tap
+        if frame_visibility.hovered_sensor_axis_from_click
+            && frame_visibility.hovered_sensor_axis.as_ref() == Some(&sensor_key)
+        {
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+        } else {
+            frame_visibility.hovered_sensor_axis = Some(sensor_key);
+            frame_visibility.hovered_sensor_axis_from_click = true;
+            // Clear other sticky selections when selecting a new one
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+        }
     }
 }
 
@@ -1588,8 +1737,41 @@ fn on_sensor_fov_out(
 ) {
     let entity = trigger.event().entity;
 
-    if sensor_query.get(entity).is_ok() {
+    // Only clear if not from a click (touch sticky)
+    if sensor_query.get(entity).is_ok() && !frame_visibility.hovered_sensor_fov_from_click {
         frame_visibility.hovered_sensor_fov = None;
+    }
+}
+
+/// Observer: Handle click/tap on a sensor FOV (for touch-friendly sticky selection)
+fn on_sensor_fov_click(
+    trigger: On<Pointer<Click>>,
+    sensor_query: Query<&SensorFovEntity>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let event = trigger.event();
+    if event.button != PointerButton::Primary {
+        return;
+    }
+
+    let entity = event.entity;
+    if let Ok(sensor_fov) = sensor_query.get(entity) {
+        let sensor_key = format!("{}:{}", sensor_fov.device_id, sensor_fov.sensor_name);
+        // Toggle: only deselect if this was already a sticky selection (from a previous click)
+        if frame_visibility.hovered_sensor_fov_from_click
+            && frame_visibility.hovered_sensor_fov.as_ref() == Some(&sensor_key)
+        {
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+        } else {
+            frame_visibility.hovered_sensor_fov = Some(sensor_key);
+            frame_visibility.hovered_sensor_fov_from_click = true;
+            // Clear other sticky selections when selecting a new one
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+        }
     }
 }
 
@@ -1598,6 +1780,7 @@ fn render_sensor_axis_tooltip(
     mut contexts: EguiContexts,
     frame_visibility: Res<FrameVisibility>,
     sensor_query: Query<&SensorAxisEntity>,
+    ui_layout: Res<UiLayout>,
 ) {
     let Some(ref hovered_key) = frame_visibility.hovered_sensor_axis else {
         return;
@@ -1628,28 +1811,35 @@ fn render_sensor_axis_tooltip(
 
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
-    if let Some(pos) = ctx.pointer_hover_pos() {
-        egui::Area::new(egui::Id::new("sensor_axis_tooltip"))
-            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
-            .order(egui::Order::Tooltip)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .show(ui, |ui| {
-                        ui.set_min_width(150.0);
-                        ui.label(egui::RichText::new(format!("{} (sensor)", sensor_name)).strong());
-                        ui.label(format!("{}/{}", category, sensor_type));
-                        if let Some(ref drv) = driver {
-                            ui.label(format!("Driver: {}", drv));
-                        }
-                        if let Some(ref align) = axis_align {
-                            ui.label(
-                                egui::RichText::new(format!("Axis: X={} Y={} Z={}", align.x, align.y, align.z))
-                                    .color(egui::Color32::YELLOW)
-                            );
-                        }
-                    });
-            });
-    }
+    // On mobile/touch, show tooltip as a card at top of screen to avoid finger occlusion
+    let tooltip_pos = if ui_layout.is_mobile {
+        egui::pos2(ui_layout.screen_width / 2.0 - 90.0, 60.0)
+    } else if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::pos2(pos.x + 15.0, pos.y + 15.0)
+    } else {
+        return;
+    };
+
+    egui::Area::new(egui::Id::new("sensor_axis_tooltip"))
+        .fixed_pos(tooltip_pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(egui::RichText::new(format!("{} (sensor)", sensor_name)).strong());
+                    ui.label(format!("{}/{}", category, sensor_type));
+                    if let Some(ref drv) = driver {
+                        ui.label(format!("Driver: {}", drv));
+                    }
+                    if let Some(ref align) = axis_align {
+                        ui.label(
+                            egui::RichText::new(format!("Axis: X={} Y={} Z={}", align.x, align.y, align.z))
+                                .color(egui::Color32::YELLOW)
+                        );
+                    }
+                });
+        });
 }
 
 /// Render tooltip for hovered sensor FOV using egui
@@ -1657,6 +1847,7 @@ fn render_sensor_fov_tooltip(
     mut contexts: EguiContexts,
     frame_visibility: Res<FrameVisibility>,
     sensor_query: Query<&SensorFovEntity>,
+    ui_layout: Res<UiLayout>,
 ) {
     let Some(ref hovered_key) = frame_visibility.hovered_sensor_fov else {
         return;
@@ -1687,28 +1878,35 @@ fn render_sensor_fov_tooltip(
 
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
-    if let Some(pos) = ctx.pointer_hover_pos() {
-        egui::Area::new(egui::Id::new("sensor_fov_tooltip"))
-            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
-            .order(egui::Order::Tooltip)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .show(ui, |ui| {
-                        ui.set_min_width(150.0);
-                        ui.label(egui::RichText::new(format!("{} FOV", sensor_name)).strong());
-                        ui.label(format!("{}/{}", category, sensor_type));
-                        if let Some(ref drv) = driver {
-                            ui.label(format!("Driver: {}", drv));
-                        }
-                        if let Some(ref align) = axis_align {
-                            ui.label(
-                                egui::RichText::new(format!("Axis: X={} Y={} Z={}", align.x, align.y, align.z))
-                                    .color(egui::Color32::YELLOW)
-                            );
-                        }
-                    });
-            });
-    }
+    // On mobile/touch, show tooltip as a card at top of screen to avoid finger occlusion
+    let tooltip_pos = if ui_layout.is_mobile {
+        egui::pos2(ui_layout.screen_width / 2.0 - 90.0, 60.0)
+    } else if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::pos2(pos.x + 15.0, pos.y + 15.0)
+    } else {
+        return;
+    };
+
+    egui::Area::new(egui::Id::new("sensor_fov_tooltip"))
+        .fixed_pos(tooltip_pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(egui::RichText::new(format!("{} FOV", sensor_name)).strong());
+                    ui.label(format!("{}/{}", category, sensor_type));
+                    if let Some(ref drv) = driver {
+                        ui.label(format!("Driver: {}", drv));
+                    }
+                    if let Some(ref align) = axis_align {
+                        ui.label(
+                            egui::RichText::new(format!("Axis: X={} Y={} Z={}", align.x, align.y, align.z))
+                                .color(egui::Color32::YELLOW)
+                        );
+                    }
+                });
+        });
 }
 
 /// Observer: Handle mouse entering a port geometry
@@ -1745,10 +1943,64 @@ fn on_port_out(
 ) {
     let entity = trigger.event().entity;
 
-    // Only clear if this is a port entity AND hover wasn't set by UI
+    // Only clear if this is a port entity AND hover wasn't set by UI or click
     let is_port = port_query.get(entity).is_ok() || port_mesh_query.get(entity).is_ok();
     if is_port && !frame_visibility.hovered_port_from_ui {
         frame_visibility.hovered_port = None;
+    }
+}
+
+/// Observer: Handle click/tap on a port (for touch-friendly sticky selection)
+fn on_port_click(
+    trigger: On<Pointer<Click>>,
+    port_query: Query<&PortEntity>,
+    port_mesh_query: Query<&PortMeshTarget>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let event = trigger.event();
+    if event.button != PointerButton::Primary {
+        return;
+    }
+
+    let entity = event.entity;
+
+    // Check PortEntity (fallback geometry)
+    if let Ok(port) = port_query.get(entity) {
+        let port_key = format!("{}:{}", port.device_id, port.port_name);
+        // Toggle: if clicking the same port, deselect; otherwise select new one
+        if frame_visibility.hovered_port.as_ref() == Some(&port_key) && frame_visibility.hovered_port_from_ui {
+            frame_visibility.hovered_port = None;
+            frame_visibility.hovered_port_from_ui = false;
+        } else {
+            frame_visibility.hovered_port = Some(port_key);
+            frame_visibility.hovered_port_from_ui = true; // Reuse this flag to make it sticky
+            // Clear other sticky selections
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+        }
+        return;
+    }
+
+    // Check PortMeshTarget (GLTF mesh-based ports)
+    if let Ok(port_mesh) = port_mesh_query.get(entity) {
+        let port_key = format!("{}:{}", port_mesh.device_id, port_mesh.port_name);
+        if frame_visibility.hovered_port.as_ref() == Some(&port_key) && frame_visibility.hovered_port_from_ui {
+            frame_visibility.hovered_port = None;
+            frame_visibility.hovered_port_from_ui = false;
+        } else {
+            frame_visibility.hovered_port = Some(port_key);
+            frame_visibility.hovered_port_from_ui = true;
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+        }
     }
 }
 
@@ -1758,6 +2010,7 @@ fn render_port_tooltip(
     frame_visibility: Res<FrameVisibility>,
     port_query: Query<&PortEntity>,
     port_mesh_query: Query<&PortMeshTarget>,
+    ui_layout: Res<UiLayout>,
 ) {
     let Some(ref hovered_key) = frame_visibility.hovered_port else {
         return;
@@ -1795,27 +2048,34 @@ fn render_port_tooltip(
 
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
-    if let Some(pos) = ctx.pointer_hover_pos() {
-        egui::Area::new(egui::Id::new("port_tooltip"))
-            .fixed_pos(egui::pos2(pos.x + 15.0, pos.y + 15.0))
-            .order(egui::Order::Tooltip)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .show(ui, |ui| {
-                        ui.set_min_width(100.0);
-                        ui.label(egui::RichText::new(&port_name).strong());
-                        // Color the port type like in the UI
-                        let type_color = match port_type.to_lowercase().as_str() {
-                            "ethernet" => egui::Color32::from_rgb(50, 200, 50),
-                            "can" => egui::Color32::from_rgb(255, 200, 50),
-                            "spi" => egui::Color32::from_rgb(200, 50, 200),
-                            "i2c" => egui::Color32::from_rgb(50, 200, 200),
-                            "uart" => egui::Color32::from_rgb(200, 100, 50),
-                            "usb" => egui::Color32::from_rgb(50, 100, 200),
-                            _ => egui::Color32::GRAY,
-                        };
-                        ui.label(egui::RichText::new(&port_type).color(type_color));
-                    });
-            });
-    }
+    // On mobile/touch, show tooltip as a card at top of screen to avoid finger occlusion
+    let tooltip_pos = if ui_layout.is_mobile {
+        egui::pos2(ui_layout.screen_width / 2.0 - 60.0, 60.0)
+    } else if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::pos2(pos.x + 15.0, pos.y + 15.0)
+    } else {
+        return;
+    };
+
+    egui::Area::new(egui::Id::new("port_tooltip"))
+        .fixed_pos(tooltip_pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_min_width(100.0);
+                    ui.label(egui::RichText::new(&port_name).strong());
+                    // Color the port type like in the UI
+                    let type_color = match port_type.to_lowercase().as_str() {
+                        "ethernet" => egui::Color32::from_rgb(50, 200, 50),
+                        "can" => egui::Color32::from_rgb(255, 200, 50),
+                        "spi" => egui::Color32::from_rgb(200, 50, 200),
+                        "i2c" => egui::Color32::from_rgb(50, 200, 200),
+                        "uart" => egui::Color32::from_rgb(200, 100, 50),
+                        "usb" => egui::Color32::from_rgb(50, 100, 200),
+                        _ => egui::Color32::GRAY,
+                    };
+                    ui.label(egui::RichText::new(&port_type).color(type_color));
+                });
+        });
 }

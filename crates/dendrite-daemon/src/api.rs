@@ -382,8 +382,34 @@ pub async fn update_device_position(
         }
 
         if !found {
-            tracing::warn!(device_id = %id, mcu_count = mcu_count, "MCU not found in HCDF, pose_cg will be saved on next upsert_device");
+            // MCU doesn't exist in HCDF yet - create a minimal entry
+            // This ensures position is persisted even before full device discovery completes
+            use dendrite_core::hcdf::Mcu;
+            let new_mcu = Mcu {
+                name: updated_device.name.clone(),
+                hwid: Some(id.clone()),
+                description: None,
+                pose_cg: Some(format!(
+                    "{} {} {} {} {} {}",
+                    pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]
+                )),
+                mass: None,
+                board: updated_device.info.board.clone(),
+                software: None,
+                discovered: None,
+                model: None,
+                visual: Vec::new(),
+                frame: Vec::new(),
+                network: None,
+            };
+            hcdf.mcu.push(new_mcu);
+            tracing::warn!(device_id = %id, mcu_count = mcu_count, "Created new MCU in HCDF with position");
         }
+    }
+
+    // Auto-save HCDF to persist position changes
+    if let Err(e) = state.save_hcdf().await {
+        tracing::warn!(error = %e, "Failed to auto-save HCDF after position update");
     }
 
     // Broadcast device update via WebSocket
@@ -846,7 +872,7 @@ pub async fn import_hcdf(
     Json(req): Json<HcdfImportRequest>,
 ) -> impl IntoResponse {
     use dendrite_core::{Hcdf, Device, DeviceId, DeviceStatus, DeviceInfo, FirmwareInfo, parse_pose_string};
-    use dendrite_core::device::{DiscoveryInfo, DiscoveryMethod};
+    use dendrite_core::device::{DiscoveryInfo, DiscoveryMethod, DeviceVisual, DeviceFrame};
     use chrono::{DateTime, Utc};
     use std::net::IpAddr;
 
@@ -862,21 +888,88 @@ pub async fn import_hcdf(
         }
     };
 
-    // Collect MCUs to convert to devices
+    // Collect MCUs and Comps to convert to devices
     let mcus_to_import: Vec<_> = imported_hcdf.mcu.clone();
+    let comps_to_import: Vec<_> = imported_hcdf.comp.clone();
     let mcu_count = mcus_to_import.len();
+    let comp_count = comps_to_import.len();
 
-    // Update HCDF state
+    // Update HCDF state - always merge to preserve existing devices
     {
         let mut hcdf = state.hcdf.write().await;
-        if req.merge {
-            // TODO: Implement proper merge logic
-            // For now, just warn and replace
-            info!("HCDF merge not yet implemented, replacing instead");
+
+        // Merge MCUs by hwid (update if exists, add if new)
+        for mcu in &mcus_to_import {
+            if let Some(hwid) = &mcu.hwid {
+                if let Some(existing) = hcdf.mcu.iter_mut().find(|m| m.hwid.as_deref() == Some(hwid)) {
+                    // Update existing MCU
+                    *existing = mcu.clone();
+                    debug!("Updated existing MCU '{}' (hwid: {})", mcu.name, hwid);
+                } else {
+                    // Add new MCU
+                    hcdf.mcu.push(mcu.clone());
+                    debug!("Added new MCU '{}' (hwid: {})", mcu.name, hwid);
+                }
+            } else {
+                // MCU without hwid - add by name match or append
+                if let Some(existing) = hcdf.mcu.iter_mut().find(|m| m.name == mcu.name && m.hwid.is_none()) {
+                    *existing = mcu.clone();
+                    debug!("Updated existing MCU '{}' (no hwid)", mcu.name);
+                } else {
+                    hcdf.mcu.push(mcu.clone());
+                    debug!("Added new MCU '{}' (no hwid)", mcu.name);
+                }
+            }
         }
-        *hcdf = imported_hcdf;
-        info!("Replaced HCDF with imported data ({} MCUs)", mcu_count);
+
+        // Merge Comps by hwid or name
+        for comp in &comps_to_import {
+            let comp_key = comp.hwid.as_ref()
+                .map(|h| format!("hwid:{}", h))
+                .unwrap_or_else(|| format!("name:{}", comp.name));
+
+            let existing = if let Some(hwid) = &comp.hwid {
+                hcdf.comp.iter_mut().find(|c| c.hwid.as_deref() == Some(hwid))
+            } else {
+                hcdf.comp.iter_mut().find(|c| c.name == comp.name && c.hwid.is_none())
+            };
+
+            if let Some(existing) = existing {
+                *existing = comp.clone();
+                debug!("Updated existing comp '{}'", comp_key);
+            } else {
+                hcdf.comp.push(comp.clone());
+                debug!("Added new comp '{}'", comp_key);
+            }
+        }
+
+        // Merge links, sensors, motors, power from imported HCDF
+        for link in &imported_hcdf.link {
+            if !hcdf.link.iter().any(|l| l.name == link.name) {
+                hcdf.link.push(link.clone());
+            }
+        }
+        for sensor in &imported_hcdf.sensor {
+            if !hcdf.sensor.iter().any(|s| s.name == sensor.name) {
+                hcdf.sensor.push(sensor.clone());
+            }
+        }
+        for motor in &imported_hcdf.motor {
+            if !hcdf.motor.iter().any(|m| m.name == motor.name) {
+                hcdf.motor.push(motor.clone());
+            }
+        }
+        for power in &imported_hcdf.power {
+            if !hcdf.power.iter().any(|p| p.name == power.name) {
+                hcdf.power.push(power.clone());
+            }
+        }
+
+        info!("Merged HCDF data ({} MCUs, {} Comps imported, now {} MCUs, {} Comps total)",
+              mcu_count, comp_count, hcdf.mcu.len(), hcdf.comp.len());
     }
+
+    let mut devices_imported = 0;
 
     // Convert MCUs to Devices and add to scanner (which broadcasts events)
     for mcu in mcus_to_import {
@@ -970,13 +1063,104 @@ pub async fn import_hcdf(
 
         // Add to scanner (this broadcasts DeviceDiscovered event to WebSocket clients)
         state.scanner.add_device(device).await;
-        info!("Imported device '{}' from HCDF", mcu.name);
+        info!("Imported device '{}' from HCDF MCU", mcu.name);
+        devices_imported += 1;
+    }
+
+    // Convert Comps with visuals to "scene objects" (devices with placeholder network info)
+    for comp in comps_to_import {
+        // Skip comps without visuals - nothing to render
+        if comp.visual.is_empty() {
+            debug!("Skipping comp '{}' - no visuals", comp.name);
+            continue;
+        }
+
+        // Create a synthetic device ID from comp name (or hwid if present)
+        let device_id = comp.hwid.as_ref()
+            .map(|h| DeviceId::from_hwid(h))
+            .unwrap_or_else(|| DeviceId::from_hwid(&format!("comp-{}", comp.name)));
+
+        let now = Utc::now();
+
+        // Convert comp visuals to device visuals
+        // Model paths in HCDF are relative to hcdf.cognipilot.org root
+        let visuals: Vec<DeviceVisual> = comp.visual.iter().map(|v| {
+            let model_path = v.model.as_ref().map(|m| {
+                // If the model href is relative, prepend the HCDF CDN base URL
+                if m.href.starts_with("http://") || m.href.starts_with("https://") {
+                    m.href.clone()
+                } else {
+                    format!("https://hcdf.cognipilot.org/{}", m.href.trim_start_matches("./"))
+                }
+            });
+            DeviceVisual {
+                name: v.name.clone(),
+                toggle: v.toggle.clone(),
+                pose: v.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| [p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+                model_path,
+                model_sha: v.model.as_ref().and_then(|m| m.sha.clone()),
+            }
+        }).collect();
+
+        // Convert comp frames to device frames
+        let frames: Vec<DeviceFrame> = comp.frame.iter().map(|f| {
+            DeviceFrame {
+                name: f.name.clone(),
+                description: f.description.clone(),
+                pose: f.pose.as_ref().and_then(|p| parse_pose_string(p)).map(|p| [p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+            }
+        }).collect();
+
+        // Parse pose from pose_cg string
+        let pose: Option<[f64; 6]> = comp.pose_cg.as_ref().and_then(|s| {
+            parse_pose_string(s).map(|p| [p.x, p.y, p.z, p.roll, p.pitch, p.yaw])
+        });
+
+        // Create device (scene object) with placeholder network info
+        let device = Device {
+            id: device_id,
+            name: comp.name.clone(),
+            status: DeviceStatus::Offline, // Static scene object - use Offline so it can be deleted
+            discovery: DiscoveryInfo {
+                ip: "127.0.0.1".parse().unwrap(), // Placeholder - not a real device
+                port: 0,
+                switch_port: None,
+                mac: None,
+                first_seen: now,
+                last_seen: now,
+                discovery_method: DiscoveryMethod::Manual,
+            },
+            info: DeviceInfo {
+                os_name: None,
+                board: comp.board.clone(),
+                processor: None,
+                bootloader: None,
+                mcuboot_mode: None,
+            },
+            firmware: FirmwareInfo::default(),
+            firmware_status: Default::default(),
+            firmware_manifest_uri: None,
+            parent_id: None,
+            model_path: comp.model.as_ref().map(|m| m.href.clone()),
+            pose,
+            visuals,
+            frames,
+            ports: Vec::new(), // TODO: Convert comp.port if needed
+            sensors: Vec::new(), // TODO: Convert comp.sensor if needed
+        };
+
+        // Add to scanner (this broadcasts DeviceDiscovered event to WebSocket clients)
+        state.scanner.add_device(device).await;
+        info!("Imported scene object '{}' from HCDF comp ({} visuals)", comp.name, comp.visual.len());
+        devices_imported += 1;
     }
 
     Json(serde_json::json!({
         "status": "imported",
         "merge": req.merge,
-        "devices_imported": mcu_count
+        "mcu_count": mcu_count,
+        "comp_count": comp_count,
+        "devices_imported": devices_imported
     }))
     .into_response()
 }

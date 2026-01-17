@@ -261,6 +261,8 @@ pub struct FrameVisibility {
     pub device_frames: std::collections::HashMap<String, bool>,
     /// Currently hovered frame (device_id:frame_name)
     pub hovered_frame: Option<String>,
+    /// Whether the frame hover came from a click/tap (sticky until next click)
+    pub hovered_frame_from_click: bool,
     /// Per-device, per-toggle-group hidden state: (device_id, toggle_group) -> is_hidden
     /// Default is visible (not hidden), so only hidden groups are tracked
     pub hidden_toggles: std::collections::HashMap<(String, String), bool>,
@@ -268,8 +270,12 @@ pub struct FrameVisibility {
     pub device_sensors: std::collections::HashMap<String, bool>,
     /// Currently hovered sensor axis frame (device_id:sensor_name)
     pub hovered_sensor_axis: Option<String>,
+    /// Whether the sensor axis hover came from a click/tap (sticky until next click)
+    pub hovered_sensor_axis_from_click: bool,
     /// Currently hovered sensor FOV (device_id:sensor_name)
     pub hovered_sensor_fov: Option<String>,
+    /// Whether the sensor FOV hover came from a click/tap (sticky until next click)
+    pub hovered_sensor_fov_from_click: bool,
     /// Currently hovered sensor from UI panel (device_id:sensor_name)
     /// When set, other sensors reduce to 30% alpha
     pub hovered_sensor_from_ui: Option<String>,
@@ -512,19 +518,36 @@ impl UiLayout {
         self.screen_height = height;
 
         // Consider mobile if width < 800 or if it's a portrait orientation with width < 600
+        let was_mobile = self.is_mobile;
         self.is_mobile = width < 800.0 || (width < height && width < 600.0);
 
-        // Scale up UI elements on mobile for better touch targets
-        self.ui_scale = if self.is_mobile { 1.3 } else { 1.0 };
+        // On first detection of mobile mode, close the left panel
+        if self.is_mobile && !was_mobile {
+            self.show_left_panel = false;
+        }
+
+        // Keep scale at 1.0 for mobile - smaller, more compact UI
+        self.ui_scale = 1.0;
     }
 
-    /// Get the width for side panels
+    /// Get the width for the left panel (device list)
     pub fn panel_width(&self) -> f32 {
         if self.is_mobile {
-            // On mobile, panels take more of the screen when shown
-            (self.screen_width * 0.85).min(350.0)
+            // On mobile, panel is ~45% of screen width for compact display
+            (self.screen_width * 0.45).min(200.0)
         } else {
             250.0
+        }
+    }
+
+    /// Get the width for the right panel (device details) - narrower on mobile
+    pub fn right_panel_width(&self) -> f32 {
+        if self.is_mobile {
+            // On mobile, narrower panel - wide enough for labels + input boxes with suffix
+            // Label (~40px) + input box with " m" suffix (~100px) + padding (~40px) = ~180px
+            180.0
+        } else {
+            300.0
         }
     }
 }

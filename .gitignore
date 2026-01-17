@@ -33,3 +33,4 @@ dendrite.local.toml
 
 # Fragment cache (downloaded HCDFs and models)
 fragments/cache/
+dendrite.hcdf

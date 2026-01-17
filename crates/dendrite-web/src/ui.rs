@@ -128,20 +128,21 @@ fn ui_system(mut params: UiParams) {
     // Get the egui context - early return if not available
     let Ok(ctx) = params.contexts.ctx_mut() else { return };
 
-    // Set up style for mobile - larger text and touch targets
+    // Set up style for mobile - compact but still touch-friendly
     if is_mobile {
         let mut style = (*ctx.style()).clone();
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(6.0, 4.0);
+        style.spacing.item_spacing = egui::vec2(4.0, 3.0);
+        style.spacing.indent = 12.0; // Reduce indent for nested items
         ctx.set_style(style);
     }
 
-    // Mobile: Show toggle buttons at top
+    // Mobile: Show toggle buttons at BOTTOM to avoid curved screen edges
     if is_mobile {
-        egui::TopBottomPanel::top("mobile_toolbar")
+        egui::TopBottomPanel::bottom("mobile_toolbar")
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Menu toggle button
+                    // Menu toggle button (left side)
                     let menu_text = if params.ui_layout.show_left_panel { "☰ Menu" } else { "☰" };
                     if ui.button(egui::RichText::new(menu_text).size(16.0 * ui_scale)).clicked() {
                         params.ui_layout.show_left_panel = !params.ui_layout.show_left_panel;
@@ -609,10 +610,15 @@ fn ui_system(mut params: UiParams) {
     if let Some(id) = params.selected.0.clone() {
         if let Some(device) = params.registry.devices.iter().find(|d| d.id == id) {
             if !is_mobile || params.ui_layout.show_right_panel {
-                egui::SidePanel::right("details_panel")
-                    .default_width(if is_mobile { panel_width } else { 300.0 })
-                    .resizable(!is_mobile)
-                    .show(ctx, |ui| {
+                let right_panel_width = params.ui_layout.right_panel_width();
+                let mut panel = egui::SidePanel::right("details_panel")
+                    .default_width(right_panel_width)
+                    .resizable(!is_mobile);
+                // On mobile, constrain panel to exact width
+                if is_mobile {
+                    panel = panel.exact_width(right_panel_width);
+                }
+                panel.show(ctx, |ui| {
                         // On mobile, add close button
                         if is_mobile {
                             ui.horizontal(|ui| {
@@ -629,14 +635,28 @@ fn ui_system(mut params: UiParams) {
 
                         ui.separator();
 
+                        // On mobile, use tighter spacing for grids
+                        let grid_spacing = if is_mobile { [4.0, 3.0] } else { [10.0, 4.0 * ui_scale] };
+
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            // On mobile, show ID outside grid so it can wrap
+                            if is_mobile {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("ID:");
+                                    ui.label(egui::RichText::new(&device.id).small());
+                                });
+                            }
+
                             egui::Grid::new("device_grid")
                                 .num_columns(2)
-                                .spacing([10.0, 4.0 * ui_scale])
+                                .spacing(grid_spacing)
                                 .show(ui, |ui| {
-                                    ui.label("Device ID:");
-                                    ui.label(&device.id);
-                                    ui.end_row();
+                                    // On desktop, show ID in grid row
+                                    if !is_mobile {
+                                        ui.label("ID:");
+                                        ui.label(&device.id);
+                                        ui.end_row();
+                                    }
 
                                     ui.label("Status:");
                                     // Show "Unknown" when heartbeat checking is off (only for online devices)
@@ -833,7 +853,7 @@ fn ui_system(mut params: UiParams) {
                             // Continue with position editing (re-enter grid)
                             egui::Grid::new("device_grid_pos")
                                 .num_columns(2)
-                                .spacing([10.0, 4.0 * ui_scale])
+                                .spacing(grid_spacing)
                                 .show(ui, |ui| {
                                     // Editable Position (ENU)
                                     ui.label("Position (ENU):");
@@ -842,8 +862,15 @@ fn ui_system(mut params: UiParams) {
 
                                     let current_pos = params.positions.positions.get(&id).cloned().unwrap_or(Vec3::ZERO);
 
+                                    // Position labels - shorter on mobile
+                                    let (x_label, y_label, z_label) = if is_mobile {
+                                        ("X:", "Y:", "Z:")
+                                    } else {
+                                        ("  X (East):", "  Y (North):", "  Z (Up):")
+                                    };
+
                                     // Editable X field
-                                    ui.label("  X (East):");
+                                    ui.label(x_label);
                                     let mut x_val = current_pos.x;
                                     let x_response = ui.add(
                                         egui::DragValue::new(&mut x_val)
@@ -853,7 +880,7 @@ fn ui_system(mut params: UiParams) {
                                     ui.end_row();
 
                                     // Editable Y field
-                                    ui.label("  Y (North):");
+                                    ui.label(y_label);
                                     let mut y_val = current_pos.y;
                                     let y_response = ui.add(
                                         egui::DragValue::new(&mut y_val)
@@ -863,7 +890,7 @@ fn ui_system(mut params: UiParams) {
                                     ui.end_row();
 
                                     // Editable Z field
-                                    ui.label("  Z (Up):");
+                                    ui.label(z_label);
                                     let mut z_val = current_pos.z;
                                     let z_response = ui.add(
                                         egui::DragValue::new(&mut z_val)

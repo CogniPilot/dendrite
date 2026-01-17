@@ -290,10 +290,68 @@ fn sync_device_entities(
             .position
             .map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
             .unwrap_or_else(|| {
-                // Auto-arrange in circle on X-Y plane if no position
-                let idx = registry.devices.iter().position(|d| d.id == device.id).unwrap_or(0);
-                let angle = (idx as f32) * std::f32::consts::TAU / registry.devices.len().max(1) as f32;
-                Vec3::new(0.15 * angle.cos(), 0.15 * angle.sin(), 0.01) // ENU: X-Y plane, Z=0.01
+                // Auto-position: origin if no other devices, otherwise radially offset to avoid collisions
+                // Collect existing device positions (from already-spawned entities)
+                let mut occupied_positions: Vec<Vec3> = existing_devices
+                    .iter()
+                    .filter_map(|(entity, _)| {
+                        transform_query.get(entity).ok().map(|t| t.translation)
+                    })
+                    .collect();
+
+                // Also include devices from registry that have explicit positions but aren't spawned yet
+                for d in &registry.devices {
+                    if d.id != device.id {
+                        if let Some(pos) = d.position {
+                            let pos_vec = Vec3::new(pos[0] as f32, pos[1] as f32, pos[2] as f32);
+                            if !occupied_positions.iter().any(|p| (*p - pos_vec).length() < 0.01) {
+                                occupied_positions.push(pos_vec);
+                            }
+                        }
+                    }
+                }
+
+                // Default bounds estimate (will be refined after model loads)
+                let estimated_bounds = 0.1_f32; // 10cm
+                let padding = 0.02_f32; // 2cm padding
+
+                if occupied_positions.is_empty() {
+                    // First device: place at origin
+                    Vec3::new(0.0, 0.0, 0.01)
+                } else {
+                    // Find non-colliding position radially outward from origin
+                    // Try positions along +X, +Y, -X, -Y axes, then diagonals, increasing radius
+                    let min_distance = estimated_bounds + padding;
+                    let directions = [
+                        Vec3::new(1.0, 0.0, 0.0),   // +X (East)
+                        Vec3::new(0.0, 1.0, 0.0),   // +Y (North)
+                        Vec3::new(-1.0, 0.0, 0.0),  // -X (West)
+                        Vec3::new(0.0, -1.0, 0.0),  // -Y (South)
+                        Vec3::new(1.0, 1.0, 0.0).normalize(),   // NE
+                        Vec3::new(-1.0, 1.0, 0.0).normalize(),  // NW
+                        Vec3::new(-1.0, -1.0, 0.0).normalize(), // SW
+                        Vec3::new(1.0, -1.0, 0.0).normalize(),  // SE
+                    ];
+
+                    // Try increasing radii until we find a non-colliding spot
+                    for radius_mult in 1..20 {
+                        let radius = min_distance * radius_mult as f32;
+                        for dir in &directions {
+                            let candidate = *dir * radius + Vec3::new(0.0, 0.0, 0.01);
+                            // Check if this position collides with any existing device
+                            let collides = occupied_positions.iter().any(|pos| {
+                                let dist_xy = ((candidate.x - pos.x).powi(2) + (candidate.y - pos.y).powi(2)).sqrt();
+                                dist_xy < min_distance
+                            });
+                            if !collides {
+                                return candidate;
+                            }
+                        }
+                    }
+
+                    // Fallback: place far away if all positions taken
+                    Vec3::new(1.0, 0.0, 0.01)
+                }
             });
 
         // Spawn new device entity
@@ -1235,7 +1293,7 @@ fn update_port_visibility(
     }
 }
 
-/// Update sensor axis material alpha based on UI hover state
+/// Update sensor axis material alpha based on UI or 3D hover state
 /// Default: 50% alpha, hovered: 100%, others when hovered: 10%
 fn update_sensor_axis_hover_alpha(
     frame_visibility: Res<FrameVisibility>,
@@ -1244,7 +1302,9 @@ fn update_sensor_axis_hover_alpha(
     mut material_query: Query<&MeshMaterial3d<StandardMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let hovered_sensor = &frame_visibility.hovered_sensor_from_ui;
+    // Check both UI hover and 3D hover/click - use whichever is active
+    let hovered_sensor: Option<&String> = frame_visibility.hovered_sensor_from_ui.as_ref()
+        .or(frame_visibility.hovered_sensor_axis.as_ref());
 
     for (entity, sensor_axis, children_opt) in sensor_axes.iter() {
         let sensor_key = format!("{}:{}", sensor_axis.device_id, sensor_axis.sensor_name);
@@ -1273,14 +1333,16 @@ fn update_sensor_axis_hover_alpha(
     }
 }
 
-/// Update sensor FOV material alpha based on UI hover state
+/// Update sensor FOV material alpha based on UI or 3D hover state
 /// Default: 10% alpha, hovered: 20%, others when hovered: 2%
 fn update_sensor_fov_hover_alpha(
     frame_visibility: Res<FrameVisibility>,
     mut sensor_fovs: Query<(&SensorFovEntity, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let hovered_sensor = &frame_visibility.hovered_sensor_from_ui;
+    // Check both UI hover and 3D hover/click - use whichever is active
+    let hovered_sensor: Option<&String> = frame_visibility.hovered_sensor_from_ui.as_ref()
+        .or(frame_visibility.hovered_sensor_fov.as_ref());
 
     for (fov, material_handle) in sensor_fovs.iter_mut() {
         let sensor_key = format!("{}:{}", fov.device_id, fov.sensor_name);

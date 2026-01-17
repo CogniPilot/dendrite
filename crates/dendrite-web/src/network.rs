@@ -178,6 +178,22 @@ impl From<FirmwareStatusJson> for FirmwareStatusData {
     }
 }
 
+/// Timer for periodic device sync to ensure UI stays in sync even if WebSocket messages are missed
+/// This is especially important for WebView environments where WebSocket reliability can vary
+#[derive(Resource)]
+pub struct PeriodicSyncTimer {
+    pub timer: Timer,
+}
+
+impl Default for PeriodicSyncTimer {
+    fn default() -> Self {
+        Self {
+            // Sync every 5 seconds
+            timer: Timer::from_seconds(5.0, TimerMode::Repeating),
+        }
+    }
+}
+
 impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         // Initialize daemon config from browser URL
@@ -192,9 +208,29 @@ impl Plugin for NetworkPlugin {
             .init_resource::<PendingHeartbeatData>()
             .init_resource::<PendingFirmwareData>()
             .init_resource::<PendingHcdfExport>()
+            .init_resource::<PeriodicSyncTimer>()
             .add_message::<ReconnectEvent>()
             .add_systems(Startup, (connect_websocket, fetch_initial_devices, fetch_network_interfaces, fetch_heartbeat_state))
-            .add_systems(Update, (process_messages, process_interface_data, process_heartbeat_data, process_firmware_data, handle_reconnect));
+            .add_systems(Update, (process_messages, process_interface_data, process_heartbeat_data, process_firmware_data, handle_reconnect, periodic_device_sync));
+    }
+}
+
+/// Periodically refetch devices from API to ensure sync
+/// This helps when WebSocket messages are missed (especially on WebView/mobile)
+fn periodic_device_sync(
+    time: Res<Time>,
+    mut sync_timer: ResMut<PeriodicSyncTimer>,
+    daemon_config: Res<DaemonConfig>,
+    pending: Res<PendingMessages>,
+) {
+    sync_timer.timer.tick(time.delta());
+
+    if sync_timer.timer.just_finished() {
+        #[cfg(target_arch = "wasm32")]
+        {
+            refetch_devices(&daemon_config, &pending);
+            tracing::debug!("Periodic device sync triggered");
+        }
     }
 }
 
