@@ -24,6 +24,34 @@ pub struct Config {
     pub fragments: FragmentsConfig,
     #[serde(default, rename = "device_override")]
     pub device_overrides: Vec<DeviceOverrideConfig>,
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// Authentication configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Whether token authentication is required for API access
+    /// When false (default), API is accessible without authentication (development mode)
+    /// When true, all API requests require a valid Bearer token
+    #[serde(default)]
+    pub require_token: bool,
+    /// Path to shared token store file from dendrite-se051d
+    #[serde(default = "default_token_store_path")]
+    pub token_store_path: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            require_token: false,
+            token_store_path: default_token_store_path(),
+        }
+    }
+}
+
+fn default_token_store_path() -> String {
+    "/run/dendrite-se051d/tokens.json".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +295,7 @@ pub fn load_config(path: &Path) -> Result<Config> {
             hcdf: HcdfConfig::default(),
             fragments: FragmentsConfig::default(),
             device_overrides: Vec::new(),
+            auth: AuthConfig::default(),
         })
     }
 }
@@ -291,6 +320,7 @@ pub fn save_default_config(path: &Path) -> Result<()> {
             port: Some(2),
             model_path: Some("models/spinali.glb".to_string()),
         }],
+        auth: AuthConfig::default(),
     };
 
     let content = toml::to_string_pretty(&config)?;

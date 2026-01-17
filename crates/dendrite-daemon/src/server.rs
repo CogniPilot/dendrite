@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use axum::{
+    middleware,
     routing::{delete, get, post, put},
     Router,
 };
@@ -11,6 +12,7 @@ use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::api;
+use crate::auth::{self, AuthState};
 use crate::config::TlsConfig;
 use crate::state::AppState;
 use crate::ws;
@@ -25,39 +27,58 @@ pub async fn run(state: Arc<AppState>, bind: &str, tls: Option<&TlsConfig>) -> R
         "Serving models from static and cached directories"
     );
 
-    // Build router
-    let app = Router::new()
-        // API routes
-        .route("/api/devices", get(api::list_devices))
-        .route("/api/devices/{id}", get(api::get_device))
-        .route("/api/devices/{id}/query", post(api::query_device))
-        .route("/api/topology", get(api::get_topology))
-        .route("/api/hcdf", get(api::get_hcdf))
-        .route("/api/hcdf", post(api::save_hcdf))
-        .route("/api/scan", post(api::trigger_scan))
-        .route("/api/devices/{id}", delete(api::remove_device))
-        .route("/api/config", get(api::get_config))
-        .route("/api/interfaces", get(api::list_interfaces))
-        .route("/api/subnet", post(api::update_subnet))
-        .route("/api/heartbeat", get(api::get_heartbeat))
-        .route("/api/heartbeat", post(api::set_heartbeat))
+    // Initialize authentication state
+    let auth_state = Arc::new(AuthState::new(state.config.auth.clone()));
+    info!(
+        require_token = state.config.auth.require_token,
+        token_store = %state.config.auth.token_store_path,
+        "Authentication configured"
+    );
+
+    // Build API router with optional auth middleware
+    let api_router = Router::new()
+        .route("/devices", get(api::list_devices))
+        .route("/devices/{id}", get(api::get_device))
+        .route("/devices/{id}/query", post(api::query_device))
+        .route("/topology", get(api::get_topology))
+        .route("/hcdf", get(api::get_hcdf))
+        .route("/hcdf", post(api::save_hcdf))
+        .route("/scan", post(api::trigger_scan))
+        .route("/devices/{id}", delete(api::remove_device))
+        .route("/config", get(api::get_config))
+        .route("/interfaces", get(api::list_interfaces))
+        .route("/subnet", post(api::update_subnet))
+        .route("/heartbeat", get(api::get_heartbeat))
+        .route("/heartbeat", post(api::set_heartbeat))
         // Device position updates
-        .route("/api/devices/{id}/position", put(api::update_device_position))
+        .route("/devices/{id}/position", put(api::update_device_position))
         // Firmware checking
-        .route("/api/firmware/check", get(api::check_all_firmware))
-        .route("/api/firmware/{id}/check", get(api::check_firmware))
+        .route("/firmware/check", get(api::check_all_firmware))
+        .route("/firmware/{id}/check", get(api::check_firmware))
         // OTA firmware updates
-        .route("/api/ota", get(api::get_all_ota_updates))
-        .route("/api/ota/{id}/start", post(api::start_ota_update))
-        .route("/api/ota/{id}/progress", get(api::get_ota_progress))
-        .route("/api/ota/{id}/cancel", post(api::cancel_ota_update))
-        .route("/api/ota/{id}/upload-local", post(api::upload_local_firmware))
+        .route("/ota", get(api::get_all_ota_updates))
+        .route("/ota/{id}/start", post(api::start_ota_update))
+        .route("/ota/{id}/progress", get(api::get_ota_progress))
+        .route("/ota/{id}/cancel", post(api::cancel_ota_update))
+        .route("/ota/{id}/upload-local", post(api::upload_local_firmware))
         // HCDF import/export (for file picker)
-        .route("/api/hcdf/export", get(api::export_hcdf))
-        .route("/api/hcdf/import", post(api::import_hcdf))
-        .route("/api/hcdf/save", post(api::save_hcdf_to_server))
-        // WebSocket for real-time updates
+        .route("/hcdf/export", get(api::export_hcdf))
+        .route("/hcdf/import", post(api::import_hcdf))
+        .route("/hcdf/save", post(api::save_hcdf_to_server))
+        .with_state(state.clone())
+        // Apply auth middleware to all API routes
+        .layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::auth_middleware,
+        ));
+
+    // Build main router
+    let app = Router::new()
+        // Nest API routes under /api
+        .nest("/api", api_router)
+        // WebSocket for real-time updates (no auth - uses token in message)
         .route("/ws", get(ws::websocket_handler))
+        .with_state(state.clone())
         // Serve cached models (from remote HCDF fetch) - takes precedence
         .nest_service("/models", ServeDir::new(&cached_models_dir)
             .fallback(ServeDir::new(&state.config.models.path)))
@@ -69,9 +90,7 @@ pub async fn run(state: Arc<AppState>, bind: &str, tls: Option<&TlsConfig>) -> R
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        )
-        // State
-        .with_state(state.clone());
+        );
 
     // Start discovery in background
     let scanner = state.scanner.clone();

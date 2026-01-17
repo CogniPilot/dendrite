@@ -3,6 +3,7 @@
 //! This is the main daemon that runs discovery and serves the web UI.
 
 mod api;
+mod auth;
 mod config;
 mod firmware_fetch;
 mod hcdf_fetch;
