@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build WASM first (platform-independent)
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli
+
+      - name: Build WASM (WebGPU + WebGL2)
+        run: |
+          chmod +x build-web.sh
+          ./build-web.sh
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: web/
+
+  # Build native binaries for each platform
+  build-native:
+    needs: build-wasm
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: dendrite
+            asset_name: dendrite-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: dendrite
+            asset_name: dendrite-linux-arm64
+            use_cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: dendrite.exe
+            asset_name: dendrite-windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for ARM64 Linux)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p dendrite-daemon
+
+      - name: Build with cross (ARM64)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} -p dendrite-daemon
+
+      - name: Download WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: web/
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release/${{ matrix.asset_name }}
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release/${{ matrix.asset_name }}/
+          cp -r web release/${{ matrix.asset_name }}/
+          cp -r config release/${{ matrix.asset_name }}/ 2>/dev/null || mkdir -p release/${{ matrix.asset_name }}/config
+          tar -czvf ${{ matrix.asset_name }}.tar.gz -C release ${{ matrix.asset_name }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release/${{ matrix.asset_name }}
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release/${{ matrix.asset_name }}/
+          Copy-Item -Recurse web release/${{ matrix.asset_name }}/
+          Copy-Item "scripts/Dendrite Viewer.bat" release/${{ matrix.asset_name }}/
+          if (Test-Path config) { Copy-Item -Recurse config release/${{ matrix.asset_name }}/ }
+          Compress-Archive -Path release/${{ matrix.asset_name }} -DestinationPath ${{ matrix.asset_name }}.zip
+
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.tar.gz
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.zip
+
+  # Create GitHub Release
+  release:
+    needs: build-native
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/dendrite-linux-x86_64/*.tar.gz
+            artifacts/dendrite-linux-arm64/*.tar.gz
+            artifacts/dendrite-windows-x86_64/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

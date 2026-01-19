@@ -38,6 +38,10 @@ struct Args {
     /// Run a single scan and exit
     #[arg(long)]
     scan_once: bool,
+
+    /// Open browser automatically when server starts
+    #[arg(short, long)]
+    open: bool,
 }
 
 #[tokio::main]
@@ -102,6 +106,23 @@ async fn main() -> Result<()> {
         }
     } else {
         // Daemon mode - run web server and discovery
+
+        // Open browser if requested (spawn task to wait for server to start)
+        if args.open {
+            let bind = config.daemon.bind.clone();
+            let is_tls = config.daemon.tls.is_some();
+            tokio::spawn(async move {
+                // Wait a moment for server to start
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let scheme = if is_tls { "https" } else { "http" };
+                let url = format!("{}://{}", scheme, bind);
+                info!("Opening browser: {}", url);
+                if let Err(e) = open::that(&url) {
+                    tracing::warn!("Failed to open browser: {}", e);
+                }
+            });
+        }
+
         server::run(state, &config.daemon.bind, config.daemon.tls.as_ref()).await?;
     }
 

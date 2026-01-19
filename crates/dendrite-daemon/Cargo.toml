@@ -9,6 +9,9 @@ description = "Dendrite daemon with web server and REST API"
 name = "dendrite"
 path = "src/main.rs"
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 dendrite-core = { workspace = true }
 dendrite-mcumgr = { workspace = true }
@@ -35,3 +38,4 @@ sha2 = "0.10"
 hex = "0.4"
 mcumgr-client = { workspace = true }
 base64 = "0.22"
+open = "5"
