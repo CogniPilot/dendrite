@@ -556,6 +556,9 @@ fn ui_system(mut params: UiParams) {
                         ui.add(
                             egui::Slider::new(&mut params.world_settings.grid_alpha, 0.0..=1.0)
                         );
+
+                        // NOTE: Render scale feature removed - scale_factor_override doesn't work
+                        // correctly in WASM (renders to partial canvas instead of downscaling)
                     });
 
                 ui.separator();

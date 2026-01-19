@@ -12,6 +12,10 @@ use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, Device
 use crate::models::{ExcludeFromBounds, PortEntity, PortMeshTarget, SensorAxisEntity, SensorFovEntity};
 use crate::network::HeartbeatState;
 
+/// Marker component for the main directional light (for shadow control)
+#[derive(Component)]
+pub struct MainDirectionalLight;
+
 pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
@@ -31,6 +35,7 @@ impl Plugin for ScenePlugin {
                 render_sensor_axis_tooltip,
                 render_sensor_fov_tooltip,
                 render_port_tooltip,
+                adjust_shadows_for_mobile,
             ))
             // Use observers for picking events (Bevy 0.17 pattern)
             .add_observer(on_device_clicked)
@@ -189,6 +194,7 @@ fn setup_scene(
             ..default()
         },
         Transform::from_xyz(2.0, 2.0, 4.0).looking_at(Vec3::ZERO, Vec3::Z),
+        MainDirectionalLight,
     ));
 
     // Point light for fill - softer
@@ -2078,4 +2084,21 @@ fn render_port_tooltip(
                     ui.label(egui::RichText::new(&port_type).color(type_color));
                 });
         });
+}
+
+/// Disable shadows on mobile devices for better performance
+fn adjust_shadows_for_mobile(
+    layout: Res<UiLayout>,
+    mut lights: Query<&mut DirectionalLight, With<MainDirectionalLight>>,
+) {
+    // Only run when layout changes (mobile detection happens once)
+    if !layout.is_changed() {
+        return;
+    }
+
+    for mut light in lights.iter_mut() {
+        // Disable shadows on mobile for performance
+        // Shadows are expensive on mobile GPUs
+        light.shadows_enabled = !layout.is_mobile;
+    }
 }

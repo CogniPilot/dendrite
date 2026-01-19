@@ -1,8 +1,10 @@
 //! Bevy application setup
 
 use bevy::prelude::*;
+use bevy::winit::WinitSettings;
 use bevy_egui::EguiPlugin;
 use bevy_picking::{DefaultPickingPlugins, prelude::MeshPickingPlugin};
+use std::time::Duration;
 
 use crate::file_picker::FilePickerPlugin;
 use crate::models::ModelsPlugin;
@@ -444,6 +446,8 @@ pub struct WorldSettings {
     pub grid_spacing: f32,
     pub grid_line_thickness: f32,
     pub grid_alpha: f32,
+    /// Render scale factor (1.0 = native, 0.5 = half resolution for performance)
+    pub render_scale: f32,
     // Track previous values to detect specific changes
     prev_spacing: f32,
     prev_thickness: f32,
@@ -458,6 +462,7 @@ impl Default for WorldSettings {
             grid_spacing: 0.1, // 10cm default spacing
             grid_line_thickness: 0.0002, // 0.2mm default thickness
             grid_alpha: 0.5, // 50% transparent by default
+            render_scale: 1.0, // Native resolution by default
             prev_spacing: 0.1,
             prev_thickness: 0.0002,
             prev_alpha: 0.5,
@@ -622,6 +627,8 @@ impl Default for GraphVisualization {
 pub fn run() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.1, 0.1, 0.15))) // Dark blue-gray background
+        // Start with default continuous rendering - mobile will switch to power-saving mode
+        .insert_resource(WinitSettings::default())
         // Bevy 0.17+ has built-in https:// asset loading via the "https" feature
         .add_plugins(DefaultPlugins
             .set(WindowPlugin {
@@ -668,5 +675,42 @@ pub fn run() {
         .add_plugins(ScenePlugin)
         .add_plugins(ModelsPlugin)
         .add_plugins(UiPlugin)
+        .add_systems(Update, (
+            adjust_power_settings_for_mobile,
+            apply_render_scale,
+        ))
         .run();
+}
+
+/// Adjust power settings based on mobile detection
+/// On mobile, use power saving mode. On desktop, use continuous rendering for smooth 3D.
+fn adjust_power_settings_for_mobile(
+    layout: Res<UiLayout>,
+    mut winit_settings: ResMut<WinitSettings>,
+) {
+    // Only update if mobile status changed
+    if !layout.is_changed() {
+        return;
+    }
+
+    if layout.is_mobile {
+        // Mobile: Power saving - reactive rendering with low idle rate
+        use bevy::winit::UpdateMode;
+        winit_settings.focused_mode = UpdateMode::reactive_low_power(Duration::from_millis(100)); // 10 FPS max when idle
+        winit_settings.unfocused_mode = UpdateMode::reactive_low_power(Duration::from_millis(500)); // 2 FPS when unfocused
+    } else {
+        // Desktop: Continuous rendering for smooth 3D interaction
+        *winit_settings = WinitSettings::default();
+    }
+}
+
+/// Apply render scale - currently disabled as scale_factor_override doesn't work correctly in WASM
+/// TODO: Implement proper render-to-texture scaling for mobile performance
+fn apply_render_scale(
+    _world_settings: Res<WorldSettings>,
+    _windows: Query<&mut Window>,
+) {
+    // scale_factor_override causes rendering to only fill part of the canvas in WASM
+    // Proper implementation would require render-to-texture with upscaling
+    // For now, this is a no-op - hiding the slider from UI until properly implemented
 }
