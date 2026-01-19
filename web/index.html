@@ -98,32 +98,6 @@
             color: #888;
         }
 
-        /* WebGPU not supported fallback */
-        #webgpu-error {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: #1a1a2e;
-            color: #eee;
-            justify-content: center;
-            align-items: center;
-            text-align: center;
-            padding: 20px;
-            z-index: 1001;
-        }
-
-        #webgpu-error h1 {
-            color: #ff6b6b;
-            margin-bottom: 20px;
-        }
-
-        #webgpu-error p {
-            max-width: 500px;
-            line-height: 1.6;
-        }
     </style>
 </head>
 <body>
@@ -132,16 +106,6 @@
         <div class="spinner"></div>
         <div class="logo">Dendrite</div>
         <div class="status">Loading hardware visualization...</div>
-    </div>
-
-    <div id="webgpu-error">
-        <div>
-            <h1>WebGPU Not Supported</h1>
-            <p>
-                Your browser doesn't support WebGPU, which is required for Dendrite's 3D visualization.
-                Please use a modern browser like Chrome 113+, Edge 113+, or Firefox Nightly with WebGPU enabled.
-            </p>
-        </div>
     </div>
 
     <canvas id="dendrite-canvas"></canvas>
@@ -162,10 +126,57 @@
         // Prevent context menu on right-click
         canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-        // Load WASM module (using WebGL2 for broad compatibility)
-        // Add cache buster to force reload
+        // Check WebGPU support
+        async function checkWebGPU() {
+            if (!navigator.gpu) {
+                return { supported: false, reason: 'navigator.gpu not available' };
+            }
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    return { supported: false, reason: 'No WebGPU adapter found' };
+                }
+                const device = await adapter.requestDevice();
+                if (!device) {
+                    return { supported: false, reason: 'Could not get WebGPU device' };
+                }
+                // Try to get adapter info (optional - not all browsers support this)
+                let info = 'WebGPU adapter';
+                try {
+                    if (adapter.requestAdapterInfo) {
+                        const adapterInfo = await adapter.requestAdapterInfo();
+                        info = `${adapterInfo.vendor} ${adapterInfo.architecture} (${adapterInfo.device})`;
+                    }
+                } catch (infoErr) {
+                    // Ignore - adapter info is optional
+                }
+                return {
+                    supported: true,
+                    info: info,
+                    adapter: adapter
+                };
+            } catch (e) {
+                return { supported: false, reason: e.message };
+            }
+        }
+
+        // Check WebGPU availability and select renderer
+        const gpuStatus = await checkWebGPU();
+        const useWebGPU = gpuStatus.supported;
+        const renderer = useWebGPU ? 'WebGPU' : 'WebGL2';
+        const moduleName = useWebGPU ? 'dendrite_web_webgpu' : 'dendrite_web_webgl2';
+
+        if (useWebGPU) {
+            console.log('Using WebGPU renderer:', gpuStatus.info);
+            document.querySelector('.status').textContent = 'Loading (WebGPU)...';
+        } else {
+            console.log('WebGPU not available:', gpuStatus.reason, '- falling back to WebGL2');
+            document.querySelector('.status').textContent = 'Loading (WebGL2)...';
+        }
+
+        // Load the appropriate WASM module
         const cacheBuster = new Date().getTime();
-        import(`./pkg/dendrite_web.js?v=${cacheBuster}`).then(async (module) => {
+        import(`./pkg/${moduleName}.js?v=${cacheBuster}`).then(async (module) => {
             await module.default();
             // Hide loading screen after init
             setTimeout(() => {
@@ -174,15 +185,38 @@
         }).catch(err => {
             // Bevy/wasm-bindgen uses exceptions for control flow - ignore these
             if (err.message && err.message.includes("Using exceptions for control flow")) {
-                console.log('Bevy initialized (ignore the exception message)');
+                console.log(`Bevy initialized with ${renderer} (ignore the exception message)`);
                 setTimeout(() => {
                     document.getElementById('loading').classList.add('hidden');
                 }, 500);
                 return;
             }
             console.error('Failed to load WASM module:', err);
-            document.querySelector('.status').textContent = 'Failed to load: ' + err.message;
-            document.querySelector('.status').style.color = '#ff6b6b';
+
+            // If WebGPU failed, try falling back to WebGL2
+            if (useWebGPU) {
+                console.log('WebGPU failed, falling back to WebGL2...');
+                document.querySelector('.status').textContent = 'Falling back to WebGL2...';
+                import(`./pkg/dendrite_web_webgl2.js?v=${cacheBuster}`).then(async (module) => {
+                    await module.default();
+                    setTimeout(() => {
+                        document.getElementById('loading').classList.add('hidden');
+                    }, 500);
+                }).catch(fallbackErr => {
+                    if (fallbackErr.message && fallbackErr.message.includes("Using exceptions for control flow")) {
+                        console.log('Bevy initialized with WebGL2 fallback');
+                        setTimeout(() => {
+                            document.getElementById('loading').classList.add('hidden');
+                        }, 500);
+                        return;
+                    }
+                    document.querySelector('.status').textContent = 'Failed to load: ' + fallbackErr.message;
+                    document.querySelector('.status').style.color = '#ff6b6b';
+                });
+            } else {
+                document.querySelector('.status').textContent = 'Failed to load: ' + err.message;
+                document.querySelector('.status').style.color = '#ff6b6b';
+            }
         });
     </script>
 </body>

@@ -8,6 +8,11 @@ description = "WebGPU-powered 3D visualization frontend for Dendrite"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["webgpu"]  # Default to WebGPU for best performance
+webgpu = ["bevy/webgpu"]
+webgl2 = ["bevy/webgl2"]
+
 [dependencies]
 bevy = { version = "0.17", default-features = false, features = [
     "bevy_asset",
@@ -22,7 +27,7 @@ bevy = { version = "0.17", default-features = false, features = [
     # NOTE: Do NOT enable bevy_picking here - we use the bevy_picking crate directly
     # to satisfy bevy_egui's dependency check (it looks for bevy_picking::PickingPlugin, not bevy::picking)
     "reflect_auto_register",  # Required for automatic type registration in scenes
-    "webgl2",  # Use WebGL2 for better Linux compatibility (WebGPU needs --enable-unsafe-webgpu flag)
+    # Renderer backend selected via features: webgpu (default) or webgl2
     "tonemapping_luts",
     "ktx2",
     "zstd_rust",  # Renamed from "zstd" in Bevy 0.17
