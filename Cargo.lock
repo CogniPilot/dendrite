@@ -2216,6 +2216,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "dendrite-viewer"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_egui",
+ "bevy_picking",
+ "console_error_panic_hook",
+ "dendrite-core",
+ "dendrite-scene",
+ "getrandom 0.2.16",
+ "getrandom 0.3.4",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-wasm",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "dendrite-web"
 version = "0.1.0"
 dependencies = [
@@ -2224,6 +2246,7 @@ dependencies = [
  "bevy_egui",
  "bevy_picking",
  "console_error_panic_hook",
+ "dendrite-scene",
  "getrandom 0.2.16",
  "getrandom 0.3.4",
  "gloo-net",
