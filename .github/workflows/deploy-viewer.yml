@@ -1,15 +1,21 @@
-# Deploy Dendrite WASM frontend to GitHub Pages
-# Builds dendrite-web for wasm32 and deploys to GitHub Pages
-name: Deploy to GitHub Pages
+# Deploy Dendrite HCDF Viewer to GitHub Pages
+# Builds dendrite-viewer for wasm32 (WebGPU + WebGL2) and deploys to dendrite.cognipilot.org
+name: Deploy Viewer to GitHub Pages
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/dendrite-viewer/**'
+      - 'crates/dendrite-scene/**'
+      - 'crates/dendrite-core/**'
+      - 'viewer-web/**'
+      - '.github/workflows/deploy-viewer.yml'
   workflow_dispatch:
 
 # Allow only one concurrent deployment
 concurrency:
-  group: "pages"
+  group: "viewer-pages"
   cancel-in-progress: true
 
 # Sets permissions of the GITHUB_TOKEN
@@ -41,9 +47,9 @@ jobs:
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-viewer-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-viewer-
 
       - name: Install wasm-bindgen-cli
         run: |
@@ -51,11 +57,19 @@ jobs:
             cargo install wasm-bindgen-cli
           fi
 
-      - name: Build WASM
+      - name: Build WASM (WebGPU)
         run: |
-          cargo build --target wasm32-unknown-unknown -p dendrite-web --release
-          mkdir -p web/pkg
-          wasm-bindgen --out-dir web/pkg --target web --no-typescript target/wasm32-unknown-unknown/release/dendrite_web.wasm
+          cargo build --target wasm32-unknown-unknown -p dendrite-viewer --release --no-default-features --features webgpu
+          mkdir -p viewer-web/pkg
+          wasm-bindgen --out-name dendrite_viewer_webgpu --out-dir viewer-web/pkg --target web --no-typescript target/wasm32-unknown-unknown/release/dendrite_viewer.wasm
+
+      - name: Build WASM (WebGL2)
+        run: |
+          cargo build --target wasm32-unknown-unknown -p dendrite-viewer --release --no-default-features --features webgl2
+          wasm-bindgen --out-name dendrite_viewer_webgl2 --out-dir viewer-web/pkg --target web --no-typescript target/wasm32-unknown-unknown/release/dendrite_viewer.wasm
+
+      - name: Create CNAME for custom domain
+        run: echo "dendrite.cognipilot.org" > viewer-web/CNAME
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
@@ -63,7 +77,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: 'web'
+          path: 'viewer-web'
 
   deploy:
     environment:
