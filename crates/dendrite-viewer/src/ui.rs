@@ -37,6 +37,7 @@ impl Plugin for UiPlugin {
         app.init_resource::<PendingHcdfContent>()
             .init_resource::<PendingDeviceRemovals>()
             .init_resource::<HcdfUrlInput>()
+            .init_resource::<HcdfBaseUrl>()
             // Check URL parameters on startup
             .add_systems(Startup, check_url_parameters)
             // UI layout updates run in Update
@@ -158,6 +159,7 @@ fn check_url_parameters(mut url_input: ResMut<HcdfUrlInput>) {
 fn process_url_fetch_results(
     mut url_input: ResMut<HcdfUrlInput>,
     mut pending_hcdf: ResMut<PendingHcdfContent>,
+    mut base_url: ResMut<HcdfBaseUrl>,
 ) {
     // Take the result from the mutex (if any) - this drops the lock immediately
     let fetch_result = {
@@ -176,6 +178,21 @@ fn process_url_fetch_results(
                 tracing::info!("HCDF fetched from URL ({} bytes)", content.len());
                 url_input.error = None;
                 pending_hcdf.0 = Some(content);
+
+                // Extract base URL for resolving relative model paths
+                // e.g., "https://hcdf.cognipilot.org/mr_mcxn_t1/optical-flow/file.hcdf"
+                //    -> "https://hcdf.cognipilot.org/"
+                if let Some(pos) = url_input.url.rfind('/') {
+                    // Get the domain/host part for model resolution
+                    if let Some(scheme_end) = url_input.url.find("://") {
+                        let after_scheme = &url_input.url[scheme_end + 3..];
+                        if let Some(first_slash) = after_scheme.find('/') {
+                            let domain_end = scheme_end + 3 + first_slash;
+                            base_url.0 = Some(url_input.url[..domain_end + 1].to_string());
+                            tracing::info!("Set HCDF base URL: {:?}", base_url.0);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!("Failed to fetch HCDF: {}", e);
@@ -568,6 +585,10 @@ impl Default for HcdfUrlInput {
         }
     }
 }
+
+/// Base URL for resolving relative model paths (set when loading HCDF from URL)
+#[derive(Resource, Default)]
+pub struct HcdfBaseUrl(pub Option<String>);
 
 /// Pending device removals (device IDs to remove from registry)
 #[derive(Resource, Default)]

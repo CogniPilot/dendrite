@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::app::{AxisAlignData, DeviceRegistry, DeviceStatus, FrameVisibility, GeometryData, PortData, SensorData, VisualData};
 use crate::scene::DeviceEntity;
+use crate::ui::HcdfBaseUrl;
 
 /// Component marking a visual child entity
 #[derive(Component)]
@@ -225,6 +226,7 @@ fn sync_device_entities(
     mut transform_query: Query<&mut Transform, With<DeviceEntity>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    base_url: Res<HcdfBaseUrl>,
 ) {
     // Collect existing device IDs and entities
     let existing_ids: HashMap<String, Entity> = existing_devices
@@ -366,7 +368,7 @@ fn sync_device_entities(
             // Check if all visuals are ready (loaded or failed)
             let all_ready = device.visuals.iter().all(|v| {
                 if let Some(ref model_path) = v.model_path {
-                    let asset_path = normalize_model_path(model_path);
+                    let asset_path = normalize_model_path(model_path, &base_url.0);
                     model_cache.ready.contains_key(&asset_path) || model_cache.models.contains_key(&asset_path)
                 } else {
                     true // No model = ready
@@ -376,7 +378,7 @@ fn sync_device_entities(
             // Start loading any visuals that aren't loading yet
             for visual in &device.visuals {
                 if let Some(ref model_path) = visual.model_path {
-                    let asset_path = normalize_model_path(model_path);
+                    let asset_path = normalize_model_path(model_path, &base_url.0);
                     if !model_cache.loading.contains_key(&asset_path)
                         && !model_cache.models.contains_key(&asset_path)
                         && !model_cache.ready.contains_key(&asset_path)
@@ -407,7 +409,7 @@ fn sync_device_entities(
                 let visual_transform = visual_to_transform(visual);
 
                 if let Some(ref model_path) = visual.model_path {
-                    let asset_path = normalize_model_path(model_path);
+                    let asset_path = normalize_model_path(model_path, &base_url.0);
                     if let Some(scene_handle) = model_cache.models.get(&asset_path) {
                         tracing::info!("Spawning visual {} for device {} from {}", visual.name, device.id, asset_path);
                         let child = commands.spawn((
@@ -430,7 +432,7 @@ fn sync_device_entities(
 
         // Legacy: If device has a single model_path, try to load it from the server
         if let Some(ref model_path) = device.model_path {
-            let asset_path = normalize_model_path(model_path);
+            let asset_path = normalize_model_path(model_path, &base_url.0);
 
             // Start loading if not already loading or loaded
             if !model_cache.loading.contains_key(&asset_path)
@@ -478,7 +480,8 @@ fn sync_device_entities(
 }
 
 /// Normalize model path for asset loading
-fn normalize_model_path(path: &str) -> String {
+/// If base_url is provided and path is relative, prepend the base URL
+fn normalize_model_path(path: &str, base_url: &Option<String>) -> String {
     // If it's an absolute URL, return as-is (Bevy can load from HTTP)
     if path.starts_with("http://") || path.starts_with("https://") {
         return path.to_string();
@@ -487,7 +490,17 @@ fn normalize_model_path(path: &str) -> String {
     // Strip leading slash
     let path = path.trim_start_matches('/');
 
-    // Ensure it starts with "models/" for local paths
+    // If we have a base URL from a remote HCDF, use it
+    if let Some(ref base) = base_url {
+        // Combine base URL with relative path
+        // base is like "https://hcdf.cognipilot.org/"
+        // path is like "models/xxx.glb"
+        let full_url = format!("{}{}", base, path);
+        tracing::info!("Resolved model path: {} -> {}", path, full_url);
+        return full_url;
+    }
+
+    // Local path: ensure it starts with "models/"
     if path.starts_with("models/") {
         path.to_string()
     } else {
