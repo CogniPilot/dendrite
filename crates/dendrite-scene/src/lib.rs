@@ -5,6 +5,7 @@
 //! HCDF viewer (dendrite-viewer).
 
 pub mod camera;
+pub mod hcdf_convert;
 pub mod models;
 pub mod scene;
 pub mod types;
