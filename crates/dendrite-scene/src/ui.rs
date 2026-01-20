@@ -12,7 +12,7 @@ pub fn render_device_details(
     ui_layout: &UiLayout,
 ) {
     let ui_scale = ui_layout.ui_scale();
-    let is_mobile = ui_layout.is_mobile;
+    let _is_mobile = ui_layout.is_mobile;
 
     // Device name and board
     ui.heading(egui::RichText::new(&device.name).size(18.0 * ui_scale));
@@ -47,7 +47,7 @@ pub fn render_device_details(
 pub fn render_sensor_list(
     ui: &mut egui::Ui,
     device: &DeviceData,
-    ui_layout: &UiLayout,
+    _ui_layout: &UiLayout,
 ) {
     if device.sensors.is_empty() {
         return;
@@ -71,7 +71,7 @@ pub fn render_sensor_list(
 pub fn render_port_list(
     ui: &mut egui::Ui,
     device: &DeviceData,
-    ui_layout: &UiLayout,
+    _ui_layout: &UiLayout,
 ) {
     if device.ports.is_empty() {
         return;
@@ -100,7 +100,7 @@ pub fn render_port_list(
 pub fn render_frame_list(
     ui: &mut egui::Ui,
     device: &DeviceData,
-    ui_layout: &UiLayout,
+    _ui_layout: &UiLayout,
 ) {
     if device.frames.is_empty() {
         return;

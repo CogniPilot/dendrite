@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Visual element data - a 3D model with a pose offset
 #[derive(Debug, Clone, Serialize, Deserialize)]

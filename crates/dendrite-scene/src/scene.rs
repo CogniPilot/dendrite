@@ -18,7 +18,7 @@ pub struct WorldAxis;
 pub struct SceneSetupPlugin;
 
 impl Plugin for SceneSetupPlugin {
-    fn build(&self, app: &mut App) {
+    fn build(&self, _app: &mut App) {
         // Scene setup systems will be added here
     }
 }

@@ -23,11 +23,26 @@ pub struct FrameGizmoEntity {
     pub frame_name: String,
 }
 
+/// Marker component for sensor FOV entities
+#[derive(Component)]
+pub struct SensorFovEntity {
+    pub device_id: String,
+    pub sensor_name: String,
+    pub fov_name: String,
+}
+
+/// Marker component for sensor axis gizmo entities
+#[derive(Component)]
+pub struct SensorAxisEntity {
+    pub device_id: String,
+    pub sensor_name: String,
+}
+
 /// Plugin for model loading
 pub struct ModelsPlugin;
 
 impl Plugin for ModelsPlugin {
-    fn build(&self, app: &mut App) {
+    fn build(&self, _app: &mut App) {
         // Model loading systems will be added here
     }
 }
