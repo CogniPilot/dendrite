@@ -1,0 +1,35 @@
+[package]
+name = "dendrite-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared 3D scene rendering and UI components for Dendrite"
+
+[features]
+default = ["webgpu"]
+webgpu = ["bevy/webgpu"]
+webgl2 = ["bevy/webgl2"]
+
+[dependencies]
+dendrite-core = { workspace = true }
+bevy = { version = "0.17", default-features = false, features = [
+    "bevy_asset",
+    "bevy_scene",
+    "bevy_winit",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_gltf",
+    "bevy_render",
+    "bevy_text",
+    "bevy_ui",
+    "reflect_auto_register",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
+    "https",
+] }
+bevy_egui = "0.38"
+bevy_picking = { version = "0.17", features = ["bevy_mesh_picking_backend"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

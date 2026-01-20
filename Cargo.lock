@@ -2203,6 +2203,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dendrite-scene"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_egui",
+ "bevy_picking",
+ "dendrite-core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "dendrite-web"
 version = "0.1.0"
 dependencies = [

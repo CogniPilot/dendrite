@@ -5,6 +5,7 @@ members = [
     "crates/dendrite-mcumgr",
     "crates/dendrite-discovery",
     "crates/dendrite-daemon",
+    "crates/dendrite-scene",
     "crates/dendrite-web",
     "crates/dendrite-qr",
 ]
@@ -21,6 +22,7 @@ authors = ["CogniPilot <info@cognipilot.org>"]
 dendrite-core = { path = "crates/dendrite-core" }
 dendrite-mcumgr = { path = "crates/dendrite-mcumgr" }
 dendrite-discovery = { path = "crates/dendrite-discovery" }
+dendrite-scene = { path = "crates/dendrite-scene" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
