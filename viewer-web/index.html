@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="description" content="CogniPilot HCDF Hardware Visualization">
+    <meta name="theme-color" content="#1a1a2e">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Dendrite HCDF Viewer</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            /* Prevent pull-to-refresh on mobile */
+            overscroll-behavior: none;
+            /* Prevent text selection on touch */
+            -webkit-user-select: none;
+            user-select: none;
+            /* Prevent tap highlight on mobile */
+            -webkit-tap-highlight-color: transparent;
+        }
+        #loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #1a1a2e;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            transition: opacity 0.5s;
+        }
+        #loading.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        #loading h1 {
+            font-size: 1.5em;
+            margin-bottom: 1em;
+            color: #4fc3f7;
+        }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #333;
+            border-top: 4px solid #4fc3f7;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 1em;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .status {
+            color: #888;
+            font-size: 0.9em;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+        /* Touch event handling */
+        @media (pointer: coarse) {
+            body { touch-action: none; }
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <h1>Dendrite HCDF Viewer</h1>
+        <div class="status">Checking WebGPU support...</div>
+    </div>
+
+    <canvas id="viewer-canvas"></canvas>
+
+    <script type="module">
+        // Prevent default middle mouse button behavior (auto-scroll)
+        const canvas = document.getElementById('viewer-canvas');
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button === 1) { // Middle mouse button
+                e.preventDefault();
+            }
+        });
+        canvas.addEventListener('auxclick', (e) => {
+            if (e.button === 1) {
+                e.preventDefault();
+            }
+        });
+        // Prevent context menu on right-click
+        canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Check WebGPU support
+        async function checkWebGPU() {
+            if (!navigator.gpu) {
+                return { supported: false, reason: 'navigator.gpu not available' };
+            }
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    return { supported: false, reason: 'No WebGPU adapter found' };
+                }
+                const device = await adapter.requestDevice();
+                if (!device) {
+                    return { supported: false, reason: 'Could not get WebGPU device' };
+                }
+                // Try to get adapter info (optional - not all browsers support this)
+                let info = 'WebGPU adapter';
+                try {
+                    if (adapter.requestAdapterInfo) {
+                        const adapterInfo = await adapter.requestAdapterInfo();
+                        info = `${adapterInfo.vendor} ${adapterInfo.architecture} (${adapterInfo.device})`;
+                    }
+                } catch (infoErr) {
+                    // Ignore - adapter info is optional
+                }
+                return {
+                    supported: true,
+                    info: info,
+                    adapter: adapter
+                };
+            } catch (e) {
+                return { supported: false, reason: e.message };
+            }
+        }
+
+        // Check WebGPU availability and select renderer
+        const gpuStatus = await checkWebGPU();
+        const useWebGPU = gpuStatus.supported;
+        const renderer = useWebGPU ? 'WebGPU' : 'WebGL2';
+        const moduleName = useWebGPU ? 'dendrite_viewer_webgpu' : 'dendrite_viewer_webgl2';
+
+        if (useWebGPU) {
+            console.log('Using WebGPU renderer:', gpuStatus.info);
+            document.querySelector('.status').textContent = 'Loading (WebGPU)...';
+        } else {
+            console.log('WebGPU not available:', gpuStatus.reason, '- falling back to WebGL2');
+            document.querySelector('.status').textContent = 'Loading (WebGL2)...';
+        }
+
+        // Load the appropriate WASM module
+        const cacheBuster = new Date().getTime();
+        import(`./pkg/${moduleName}.js?v=${cacheBuster}`).then(async (module) => {
+            await module.default();
+            // Hide loading screen after init
+            setTimeout(() => {
+                document.getElementById('loading').classList.add('hidden');
+            }, 500);
+        }).catch(err => {
+            // Bevy/wasm-bindgen uses exceptions for control flow - ignore these
+            if (err.message && err.message.includes("Using exceptions for control flow")) {
+                console.log(`Bevy initialized with ${renderer} (ignore the exception message)`);
+                setTimeout(() => {
+                    document.getElementById('loading').classList.add('hidden');
+                }, 500);
+                return;
+            }
+            console.error('Failed to load WASM module:', err);
+
+            // If WebGPU failed, try falling back to WebGL2
+            if (useWebGPU) {
+                console.log('WebGPU failed, falling back to WebGL2...');
+                document.querySelector('.status').textContent = 'Falling back to WebGL2...';
+                import(`./pkg/dendrite_viewer_webgl2.js?v=${cacheBuster}`).then(async (module) => {
+                    await module.default();
+                    setTimeout(() => {
+                        document.getElementById('loading').classList.add('hidden');
+                    }, 500);
+                }).catch(fallbackErr => {
+                    if (fallbackErr.message && fallbackErr.message.includes("Using exceptions for control flow")) {
+                        console.log('Bevy initialized with WebGL2 fallback');
+                        setTimeout(() => {
+                            document.getElementById('loading').classList.add('hidden');
+                        }, 500);
+                        return;
+                    }
+                    document.querySelector('.status').textContent = 'Failed to load: ' + fallbackErr.message;
+                    document.querySelector('.status').style.color = '#ff6b6b';
+                });
+            } else {
+                document.querySelector('.status').textContent = 'Failed to load: ' + err.message;
+                document.querySelector('.status').style.color = '#ff6b6b';
+            }
+        });
+    </script>
+</body>
+</html>

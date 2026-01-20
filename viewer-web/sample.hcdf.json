@@ -1,0 +1,140 @@
+[
+  {
+    "id": "optical-flow",
+    "name": "Optical Flow Assembly",
+    "board": "mr_mcxn_t1",
+    "ip": "192.0.2.1",
+    "port": null,
+    "status": "Online",
+    "version": "0.0.0",
+    "position": [0.0, 0.0, 0.0],
+    "orientation": [0.0, 0.0, 0.0],
+    "model_path": null,
+    "visuals": [
+      {
+        "name": "optical_flow_board",
+        "toggle": null,
+        "pose": [0, 0, -0.0008, 1.5708, 0, 1.5708],
+        "model_path": "https://hcdf.cognipilot.org/models/72eef172-optical_flow.glb",
+        "model_sha": null
+      },
+      {
+        "name": "hub_board",
+        "toggle": null,
+        "pose": [0, 0, -0.00945, 1.5708, 0, 1.5708],
+        "model_path": "https://hcdf.cognipilot.org/models/fc0bc0ac-mcxnt1hub.glb",
+        "model_sha": null
+      },
+      {
+        "name": "mcxnt1hub_base",
+        "toggle": "case",
+        "pose": [0, 0, -0.014, 0, 3.14159, -1.5708],
+        "model_path": "https://hcdf.cognipilot.org/models/86d9c8c8-mcxnt1hub_base.glb",
+        "model_sha": null
+      }
+    ],
+    "frames": [
+      {
+        "name": "board_origin",
+        "description": "Main board origin",
+        "pose": [0, 0, 0, 0, 0, 0]
+      },
+      {
+        "name": "optical_sensor",
+        "description": "Optical flow sensor frame",
+        "pose": [0, 0, 0.002, 3.14159, 0, 0]
+      }
+    ],
+    "ports": [
+      {"name": "ETH0", "port_type": "Ethernet", "pose": [0.0225, -0.0155, -0.0085, 0, 0, 0], "geometry": [], "visual_name": null, "mesh_name": null},
+      {"name": "CAN0", "port_type": "CAN", "pose": [-0.0225, -0.0155, -0.0085, 0, 0, 0], "geometry": [], "visual_name": null, "mesh_name": null}
+    ],
+    "sensors": [
+      {
+        "name": "imu_hub",
+        "category": "inertial",
+        "sensor_type": "accel_gyro",
+        "driver": "icm45686",
+        "pose": [0.016, -0.001, -0.0075, 0, 0, 0],
+        "axis_align": {"x": "X", "y": "Y", "z": "Z"},
+        "geometry": null,
+        "fovs": []
+      },
+      {
+        "name": "paa3905",
+        "category": "optical",
+        "sensor_type": "optical_flow",
+        "driver": "paa3905",
+        "pose": [-0.0005, -0.0002, 0.002, 0, 0, 0],
+        "axis_align": null,
+        "geometry": null,
+        "fovs": [
+          {
+            "name": "imager",
+            "color": [0.5, 1.0, 0.5],
+            "pose": null,
+            "geometry": {"PyramidalFrustum": {"near": 0.08, "far": 0.5, "hfov": 0.733, "vfov": 0.733}}
+          }
+        ]
+      }
+    ],
+    "last_seen": "2026-01-20T00:00:00+00:00"
+  },
+  {
+    "id": "rtk-gnss",
+    "name": "RTK GNSS Module",
+    "board": "mr_mcxn_t1",
+    "ip": "192.0.2.3",
+    "port": null,
+    "status": "Online",
+    "version": "0.0.0",
+    "position": [0.15, 0.0, 0.0],
+    "orientation": [0.0, 0.0, 0.0],
+    "model_path": "https://hcdf.cognipilot.org/models/47b58869-rtk_f9p.glb",
+    "visuals": [],
+    "frames": [
+      {
+        "name": "antenna",
+        "description": "GNSS antenna phase center",
+        "pose": [0, 0, 0.01, 0, 0, 0]
+      }
+    ],
+    "ports": [
+      {"name": "ETH0", "port_type": "Ethernet", "pose": null, "geometry": [], "visual_name": null, "mesh_name": null}
+    ],
+    "sensors": [
+      {
+        "name": "gnss",
+        "category": "rf",
+        "sensor_type": "gnss",
+        "driver": "ublox_f9p",
+        "pose": [0, 0, 0.01, 0, 0, 0],
+        "axis_align": null,
+        "geometry": null,
+        "fovs": []
+      }
+    ],
+    "last_seen": "2026-01-20T00:00:00+00:00"
+  },
+  {
+    "id": "flex-io",
+    "name": "Flex I/O Hub",
+    "board": "mr_mcxn_t1",
+    "ip": "192.0.2.4",
+    "port": null,
+    "status": "Online",
+    "version": "0.0.0",
+    "position": [0.0, 0.15, 0.01],
+    "orientation": [0.0, 0.0, 0.0],
+    "model_path": "https://hcdf.cognipilot.org/models/95e587b1-flex_io.glb",
+    "visuals": [],
+    "frames": [],
+    "ports": [
+      {"name": "ETH0", "port_type": "Ethernet", "pose": null, "geometry": [], "visual_name": null, "mesh_name": null},
+      {"name": "PWM1", "port_type": "PWM", "pose": null, "geometry": [], "visual_name": null, "mesh_name": null},
+      {"name": "PWM2", "port_type": "PWM", "pose": null, "geometry": [], "visual_name": null, "mesh_name": null}
+    ],
+    "sensors": [],
+    "last_seen": "2026-01-20T00:00:00+00:00"
+  }
+]
