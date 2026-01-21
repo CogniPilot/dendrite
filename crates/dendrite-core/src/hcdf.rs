@@ -2,6 +2,134 @@
 //!
 //! HCDF is an XML-based format for describing hardware configurations,
 //! extending URDF concepts for CogniPilot systems.
+//!
+//! # Port Schema
+//!
+//! Ports represent physical connection interfaces on components. There are two
+//! ways to visualize ports:
+//!
+//! ## Mode 1: Mesh Reference
+//! Reference an existing mesh node within a visual's GLTF model:
+//! ```xml
+//! <port name="ETH0" type="ethernet" visual="board" mesh="ETH0">
+//!   <capabilities>
+//!     <speed unit="Mbps">1000</speed>
+//!   </capabilities>
+//! </port>
+//! ```
+//!
+//! ## Mode 2: Fallback Visual
+//! When no mesh is available, define inline geometry with pose:
+//! ```xml
+//! <port name="CAN0" type="CAN">
+//!   <capabilities>
+//!     <bitrate unit="bps">500000</bitrate>
+//!     <protocol>CAN-FD</protocol>
+//!   </capabilities>
+//!   <fallback_visual>
+//!     <pose>-0.0225 -0.0155 -0.0085 0 0 0</pose>
+//!     <geometry>
+//!       <box><size>0.005 0.004 0.003</size></box>
+//!     </geometry>
+//!   </fallback_visual>
+//! </port>
+//! ```
+//!
+//! The `<fallback_visual>` element follows URDF/SDF conventions with pose and
+//! geometry as siblings. The `<capabilities>` element contains type-specific
+//! properties like speed (ethernet), bitrate (CAN), baud (serial), and protocol.
+//!
+//! ## Port Power Capabilities
+//!
+//! Power capabilities can be added to any port type (POWER, Ethernet with PoE/PoDL,
+//! USB with PD, CAN with power pins, etc.):
+//!
+//! ```xml
+//! <port name="pwr_in" type="POWER" visual="main_board" mesh="pwr">
+//!   <capabilities>
+//!     <voltage unit="V" min="7" max="28">12</voltage>
+//!     <current unit="A" max="3"/>
+//!     <power unit="W" max="36"/>
+//!     <capacity unit="Wh">55.5</capacity>  <!-- for batteries -->
+//!     <connector>XT30</connector>
+//!   </capabilities>
+//! </port>
+//! ```
+//!
+//! Data ports with power delivery (e.g., Ethernet with PoDL):
+//! ```xml
+//! <port name="eth_podl" type="ethernet" visual="board" mesh="eth">
+//!   <capabilities>
+//!     <speed unit="Mbps">1000</speed>
+//!     <standard>1000BASE-T1</standard>
+//!     <protocol>PoDL</protocol>
+//!     <voltage unit="V" min="12" max="48">24</voltage>
+//!     <power unit="W" max="50"/>
+//!   </capabilities>
+//! </port>
+//! ```
+//!
+//! # Antenna Schema
+//!
+//! Antennas represent wireless interfaces and follow the same pattern as ports.
+//! Capabilities are organized into:
+//! - `band`: RF frequency bands (e.g., "2.4 GHz", "5 GHz", "L1", "L2")
+//! - `standard`: PHY/MAC layer specs (e.g., "802.11ax", "802.15.4", "Bluetooth 5.4")
+//! - `protocol`: Higher-layer protocols (e.g., "Thread", "6LoWPAN", "Matter")
+//!
+//! ## Mode 1: Mesh Reference
+//! ```xml
+//! <antenna name="GNSS0" type="gnss" visual="board" mesh="GNSS_ANT">
+//!   <capabilities>
+//!     <band>L1</band>
+//!     <band>L2</band>
+//!     <band>L5</band>
+//!     <gain unit="dBi">3.5</gain>
+//!     <polarization>RHCP</polarization>
+//!   </capabilities>
+//! </antenna>
+//! ```
+//!
+//! ## Tri-Radio Example (Wi-Fi 6 / Bluetooth 5.4 / 802.15.4)
+//! ```xml
+//! <antenna name="mlan0" type="wifi" visual="board" mesh="ant0">
+//!   <capabilities>
+//!     <band>2.4 GHz</band>
+//!     <band>5 GHz</band>
+//!     <gain unit="dBi">2.0</gain>
+//!     <standard>802.11ax</standard>
+//!     <protocol>WPA3</protocol>
+//!   </capabilities>
+//! </antenna>
+//!
+//! <antenna name="wpan0" type="802.15.4" visual="board" mesh="ant1">
+//!   <capabilities>
+//!     <band>2.4 GHz</band>
+//!     <gain unit="dBi">2.0</gain>
+//!     <standard>Bluetooth 5.4</standard>
+//!     <standard>802.15.4</standard>
+//!     <protocol>Thread</protocol>
+//!     <protocol>6LoWPAN</protocol>
+//!     <protocol>Matter</protocol>
+//!   </capabilities>
+//! </antenna>
+//! ```
+//!
+//! ## Mode 2: Fallback Visual
+//! ```xml
+//! <antenna name="WIFI0" type="wifi">
+//!   <capabilities>
+//!     <band>2.4 GHz</band>
+//!     <standard>802.11n</standard>
+//!   </capabilities>
+//!   <fallback_visual>
+//!     <pose>0.01 0.02 0.005 0 0 0</pose>
+//!     <geometry>
+//!       <cylinder><radius>0.002</radius><length>0.015</length></cylinder>
+//!     </geometry>
+//!   </fallback_visual>
+//! </antenna>
+//! ```
 
 use quick_xml::de::from_str;
 use quick_xml::se::Serializer;
@@ -145,8 +273,85 @@ pub struct Mcu {
     pub network: Option<Network>,
 }
 
-/// Companion computer element in HCDF
+/// Child element types that can be interleaved in a Comp/Mcu
+/// Using $value enum pattern to handle non-consecutive XML elements
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CompChild {
+    Description(String),
+    #[serde(rename = "pose_cg")]
+    PoseCg(String),
+    Mass(f64),
+    Board(String),
+    Software(Software),
+    Discovered(Discovered),
+    Model(ModelRef),
+    Visual(Visual),
+    Frame(Frame),
+    Network(Network),
+    Port(Port),
+    Antenna(Antenna),
+    Sensor(Sensor),
+}
+
+/// Internal struct for deserializing Comp with interleaved children
+#[derive(Debug, Clone, Deserialize)]
+struct CompRaw {
+    #[serde(rename = "@name")]
+    name: String,
+    #[serde(rename = "@role", default)]
+    role: Option<String>,
+    #[serde(rename = "@hwid", default)]
+    hwid: Option<String>,
+    #[serde(rename = "$value", default)]
+    children: Vec<CompChild>,
+}
+
+impl From<CompRaw> for Comp {
+    fn from(raw: CompRaw) -> Self {
+        let mut comp = Comp {
+            name: raw.name,
+            role: raw.role,
+            hwid: raw.hwid,
+            description: None,
+            pose_cg: None,
+            mass: None,
+            board: None,
+            software: None,
+            discovered: None,
+            model: None,
+            visual: Vec::new(),
+            frame: Vec::new(),
+            network: None,
+            port: Vec::new(),
+            antenna: Vec::new(),
+            sensor: Vec::new(),
+        };
+
+        for child in raw.children {
+            match child {
+                CompChild::Description(v) => comp.description = Some(v),
+                CompChild::PoseCg(v) => comp.pose_cg = Some(v),
+                CompChild::Mass(v) => comp.mass = Some(v),
+                CompChild::Board(v) => comp.board = Some(v),
+                CompChild::Software(v) => comp.software = Some(v),
+                CompChild::Discovered(v) => comp.discovered = Some(v),
+                CompChild::Model(v) => comp.model = Some(v),
+                CompChild::Visual(v) => comp.visual.push(v),
+                CompChild::Frame(v) => comp.frame.push(v),
+                CompChild::Network(v) => comp.network = Some(v),
+                CompChild::Port(v) => comp.port.push(v),
+                CompChild::Antenna(v) => comp.antenna.push(v),
+                CompChild::Sensor(v) => comp.sensor.push(v),
+            }
+        }
+
+        comp
+    }
+}
+
+/// Companion computer element in HCDF
+#[derive(Debug, Clone, Serialize)]
 pub struct Comp {
     #[serde(rename = "@name")]
     pub name: String,
@@ -186,6 +391,16 @@ pub struct Comp {
     /// Sensors
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sensor: Vec<Sensor>,
+}
+
+impl<'de> Deserialize<'de> for Comp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = CompRaw::deserialize(deserializer)?;
+        Ok(raw.into())
+    }
 }
 
 /// Reference to a 3D model file
@@ -438,6 +653,168 @@ impl Geometry {
 
 // ============ PORTS ============
 
+/// Value with optional unit attribute
+/// Used for capability values like speed, bitrate, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValueWithUnit {
+    #[serde(rename = "@unit", default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(rename = "$value")]
+    pub value: String,
+}
+
+impl ValueWithUnit {
+    /// Parse the value as f64
+    pub fn parse_value(&self) -> Option<f64> {
+        self.value.parse().ok()
+    }
+
+    /// Parse the value as u64
+    pub fn parse_value_u64(&self) -> Option<u64> {
+        self.value.parse().ok()
+    }
+}
+
+/// Voltage capability with range (min/max) and nominal value
+/// Example: `<voltage unit="V" min="7" max="28">12</voltage>`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoltageCapability {
+    #[serde(rename = "@unit", default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(rename = "@min", default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(rename = "@max", default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Nominal voltage value
+    #[serde(rename = "$value", default)]
+    pub value: Option<String>,
+}
+
+impl VoltageCapability {
+    /// Format as display string (e.g., "12V (7-28V)")
+    pub fn to_display_string(&self) -> String {
+        let unit = self.unit.as_deref().unwrap_or("V");
+        let nominal = self.value.as_deref().unwrap_or("");
+        match (self.min, self.max, nominal.is_empty()) {
+            (Some(min), Some(max), false) => format!("{}{} ({}-{}{})", nominal, unit, min, max, unit),
+            (Some(min), Some(max), true) => format!("{}-{}{}", min, max, unit),
+            (None, Some(max), false) => format!("{}{} (max {}{})", nominal, unit, max, unit),
+            (Some(min), None, false) => format!("{}{} (min {}{})", nominal, unit, min, unit),
+            _ if !nominal.is_empty() => format!("{}{}", nominal, unit),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Current capability with max value
+/// Example: `<current unit="A" max="3"/>`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentCapability {
+    #[serde(rename = "@unit", default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(rename = "@max", default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Optional nominal value
+    #[serde(rename = "$value", default)]
+    pub value: Option<String>,
+}
+
+impl CurrentCapability {
+    /// Format as display string (e.g., "3A max")
+    pub fn to_display_string(&self) -> String {
+        let unit = self.unit.as_deref().unwrap_or("A");
+        match (&self.value, self.max) {
+            (Some(v), Some(max)) if !v.is_empty() => format!("{}{} (max {}{})", v, unit, max, unit),
+            (_, Some(max)) => format!("{}{} max", max, unit),
+            (Some(v), None) if !v.is_empty() => format!("{}{}", v, unit),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Power capability with max value (in watts)
+/// Example: `<power unit="W" max="36"/>`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerCapability {
+    #[serde(rename = "@unit", default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(rename = "@max", default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Optional nominal value
+    #[serde(rename = "$value", default)]
+    pub value: Option<String>,
+}
+
+impl PowerCapability {
+    /// Format as display string (e.g., "36W max")
+    pub fn to_display_string(&self) -> String {
+        let unit = self.unit.as_deref().unwrap_or("W");
+        match (&self.value, self.max) {
+            (Some(v), Some(max)) if !v.is_empty() => format!("{}{} (max {}{})", v, unit, max, unit),
+            (_, Some(max)) => format!("{}{} max", max, unit),
+            (Some(v), None) if !v.is_empty() => format!("{}{}", v, unit),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Port capabilities - type-specific properties
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PortCapabilities {
+    // === Data Capabilities ===
+    /// Network speed (e.g., for ethernet) - typically in Mbps
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<ValueWithUnit>,
+    /// Bitrate (e.g., for CAN, serial) - typically in bps
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<ValueWithUnit>,
+    /// Baud rate (e.g., for UART/serial) - typically in baud
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<ValueWithUnit>,
+    /// Physical layer standard (e.g., "1000BASE-T", "1000BASE-T1", "100BASE-TX")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard: Option<String>,
+    /// Protocol variants (e.g., "TSN", "CAN-FD", "PoDL", "PoE+") - supports multiple protocols
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol: Vec<String>,
+
+    // === Power Capabilities (available on any port type) ===
+    /// Voltage with range (min/max) and nominal value
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voltage: Option<VoltageCapability>,
+    /// Maximum current
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<CurrentCapability>,
+    /// Maximum power in watts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerCapability>,
+    /// Energy capacity for batteries
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<ValueWithUnit>,
+    /// Physical connector type (e.g., "XT60", "RJ45", "USB-C", "JST-GH")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+}
+
+/// Fallback visual for ports/antennas when mesh reference unavailable
+/// Follows URDF/SDF pattern with pose and geometry as siblings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackVisual {
+    /// Pose offset: "x y z roll pitch yaw" (meters, radians)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pose: Option<String>,
+    /// Geometry primitive for visualization
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<Geometry>,
+}
+
+impl FallbackVisual {
+    /// Parse the pose string into a Pose struct
+    pub fn parse_pose(&self) -> Option<Pose> {
+        self.pose.as_ref().and_then(|s| parse_pose_string(s))
+    }
+}
+
 /// Port element - physical connection interface
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Port {
@@ -446,23 +823,100 @@ pub struct Port {
     #[serde(rename = "@type")]
     pub port_type: String,
     /// Reference to visual containing the mesh (e.g., "board")
-    #[serde(rename = "@visual", default)]
+    #[serde(rename = "@visual", default, skip_serializing_if = "Option::is_none")]
     pub visual: Option<String>,
     /// GLTF mesh node name within the visual (e.g., "port_eth0")
-    #[serde(rename = "@mesh", default)]
+    #[serde(rename = "@mesh", default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
-    /// Pose: "x y z roll pitch yaw"
-    #[serde(default)]
+    /// Port capabilities (speed, bitrate, protocol, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<PortCapabilities>,
+    /// Fallback visual when mesh reference unavailable
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_visual: Option<FallbackVisual>,
+    /// Legacy: Pose at port level (deprecated, use fallback_visual instead)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose: Option<String>,
-    /// Geometry for visualization/interaction
-    #[serde(default)]
+    /// Legacy: Geometry at port level (deprecated, use fallback_visual instead)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub geometry: Vec<Geometry>,
 }
 
 impl Port {
     /// Parse the pose string into a Pose struct
+    /// Checks fallback_visual first, then legacy pose field
     pub fn parse_pose(&self) -> Option<Pose> {
+        // Prefer fallback_visual pose
+        if let Some(ref fv) = self.fallback_visual {
+            if let Some(pose) = fv.parse_pose() {
+                return Some(pose);
+            }
+        }
+        // Fall back to legacy pose field
         self.pose.as_ref().and_then(|s| parse_pose_string(s))
+    }
+
+    /// Get the geometry for visualization
+    /// Checks fallback_visual first, then legacy geometry field
+    pub fn get_geometry(&self) -> Option<&Geometry> {
+        // Prefer fallback_visual geometry
+        if let Some(ref fv) = self.fallback_visual {
+            if fv.geometry.is_some() {
+                return fv.geometry.as_ref();
+            }
+        }
+        // Fall back to legacy geometry field
+        self.geometry.first()
+    }
+
+    /// Check if this port uses a mesh reference (vs fallback visual)
+    pub fn has_mesh_reference(&self) -> bool {
+        self.visual.is_some() && self.mesh.is_some()
+    }
+}
+
+// ============ ANTENNAS ============
+
+/// Antenna capabilities - type-specific properties for wireless interfaces
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AntennaCapabilities {
+    /// Frequency bands (e.g., ["L1", "L2", "L5"] for GNSS, ["2.4 GHz", "5 GHz"] for WiFi)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub band: Vec<String>,
+    /// Legacy: frequency with unit (deprecated, use band instead)
+    /// Example: `<frequency unit="GHz">5.5</frequency>` -> "5.5 GHz"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<ValueWithUnit>,
+    /// Antenna gain in dBi
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain: Option<ValueWithUnit>,
+    /// PHY/MAC standards (e.g., "802.11ax", "802.15.4", "Bluetooth 5.4")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standard: Vec<String>,
+    /// Higher-layer protocols (e.g., "Thread", "6LoWPAN", "Matter", "WPA3")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol: Vec<String>,
+    /// Polarization (e.g., "RHCP", "linear", "circular")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polarization: Option<String>,
+}
+
+impl AntennaCapabilities {
+    /// Get all frequency bands, combining new `band` elements with legacy `frequency`
+    pub fn get_bands(&self) -> Vec<String> {
+        let mut bands = self.band.clone();
+        // Add legacy frequency if present
+        if let Some(ref freq) = self.frequency {
+            let freq_str = if let Some(ref unit) = freq.unit {
+                format!("{} {}", freq.value, unit)
+            } else {
+                freq.value.clone()
+            };
+            if !bands.contains(&freq_str) {
+                bands.push(freq_str);
+            }
+        }
+        bands
     }
 }
 
@@ -473,18 +927,56 @@ pub struct Antenna {
     pub name: String,
     #[serde(rename = "@type")]
     pub antenna_type: String,
-    /// Pose: "x y z roll pitch yaw"
-    #[serde(default)]
+    /// Reference to visual containing the mesh (e.g., "board")
+    #[serde(rename = "@visual", default, skip_serializing_if = "Option::is_none")]
+    pub visual: Option<String>,
+    /// GLTF mesh node name within the visual (e.g., "gnss_antenna")
+    #[serde(rename = "@mesh", default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// Antenna capabilities (frequency, gain, protocol, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<AntennaCapabilities>,
+    /// Fallback visual when mesh reference unavailable
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_visual: Option<FallbackVisual>,
+    /// Legacy: Pose at antenna level (deprecated, use fallback_visual instead)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose: Option<String>,
-    /// Geometry for visualization
-    #[serde(default)]
+    /// Legacy: Geometry at antenna level (deprecated, use fallback_visual instead)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<Geometry>,
 }
 
 impl Antenna {
     /// Parse the pose string into a Pose struct
+    /// Checks fallback_visual first, then legacy pose field
     pub fn parse_pose(&self) -> Option<Pose> {
+        // Prefer fallback_visual pose
+        if let Some(ref fv) = self.fallback_visual {
+            if let Some(pose) = fv.parse_pose() {
+                return Some(pose);
+            }
+        }
+        // Fall back to legacy pose field
         self.pose.as_ref().and_then(|s| parse_pose_string(s))
+    }
+
+    /// Get the geometry for visualization
+    /// Checks fallback_visual first, then legacy geometry field
+    pub fn get_geometry(&self) -> Option<&Geometry> {
+        // Prefer fallback_visual geometry
+        if let Some(ref fv) = self.fallback_visual {
+            if fv.geometry.is_some() {
+                return fv.geometry.as_ref();
+            }
+        }
+        // Fall back to legacy geometry field
+        self.geometry.as_ref()
+    }
+
+    /// Check if this antenna uses a mesh reference (vs fallback visual)
+    pub fn has_mesh_reference(&self) -> bool {
+        self.visual.is_some() && self.mesh.is_some()
     }
 }
 
@@ -1232,4 +1724,433 @@ mod tests {
         assert_eq!(mat[1], [-1.0, 0.0, 0.0]);
         assert_eq!(mat[2], [0.0, 0.0, 1.0]);
     }
+
+    #[test]
+    fn test_parse_port_with_capabilities_and_fallback_visual() {
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="2.1">
+  <comp name="rtk-gnss" role="sensor">
+    <description>RTK GNSS assembly</description>
+
+    <!-- Port with mesh reference and capabilities -->
+    <port name="ETH0" type="ethernet" visual="board" mesh="ETH0">
+      <capabilities>
+        <speed unit="Mbps">1000</speed>
+      </capabilities>
+    </port>
+
+    <!-- Port with fallback visual (no mesh available) -->
+    <port name="CAN0" type="CAN">
+      <capabilities>
+        <bitrate unit="bps">500000</bitrate>
+        <protocol>CAN-FD</protocol>
+      </capabilities>
+      <fallback_visual>
+        <pose>-0.0225 -0.0155 -0.0085 0 0 0</pose>
+        <geometry>
+          <box><size>0.005 0.004 0.003</size></box>
+        </geometry>
+      </fallback_visual>
+    </port>
+
+    <!-- Port with serial capabilities -->
+    <port name="UART0" type="serial">
+      <capabilities>
+        <baud unit="baud">115200</baud>
+        <protocol>RS-232</protocol>
+      </capabilities>
+      <fallback_visual>
+        <pose>0.01 0.005 -0.008 0 0 0</pose>
+        <geometry>
+          <box><size>0.003 0.002 0.002</size></box>
+        </geometry>
+      </fallback_visual>
+    </port>
+
+  </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml).unwrap();
+        assert_eq!(hcdf.version, "2.1");
+        assert_eq!(hcdf.comp.len(), 1);
+
+        let comp = &hcdf.comp[0];
+        assert_eq!(comp.port.len(), 3);
+
+        // Check ETH0 - mesh reference with capabilities
+        let eth0 = &comp.port[0];
+        assert_eq!(eth0.name, "ETH0");
+        assert_eq!(eth0.port_type, "ethernet");
+        assert_eq!(eth0.visual, Some("board".to_string()));
+        assert_eq!(eth0.mesh, Some("ETH0".to_string()));
+        assert!(eth0.has_mesh_reference());
+        assert!(eth0.fallback_visual.is_none());
+
+        // Check ETH0 capabilities
+        let eth_caps = eth0.capabilities.as_ref().unwrap();
+        let speed = eth_caps.speed.as_ref().unwrap();
+        assert_eq!(speed.value, "1000");
+        assert_eq!(speed.unit, Some("Mbps".to_string()));
+        assert_eq!(speed.parse_value_u64(), Some(1000));
+
+        // Check CAN0 - fallback visual with capabilities
+        let can0 = &comp.port[1];
+        assert_eq!(can0.name, "CAN0");
+        assert_eq!(can0.port_type, "CAN");
+        assert!(!can0.has_mesh_reference());
+
+        // Check CAN0 capabilities
+        let can_caps = can0.capabilities.as_ref().unwrap();
+        let bitrate = can_caps.bitrate.as_ref().unwrap();
+        assert_eq!(bitrate.value, "500000");
+        assert_eq!(bitrate.unit, Some("bps".to_string()));
+        assert_eq!(can_caps.protocol, vec!["CAN-FD".to_string()]);
+
+        // Check CAN0 fallback visual
+        let can_fv = can0.fallback_visual.as_ref().unwrap();
+        let can_pose = can_fv.parse_pose().unwrap();
+        assert!((can_pose.x - (-0.0225)).abs() < 0.0001);
+        assert!((can_pose.y - (-0.0155)).abs() < 0.0001);
+
+        // Check CAN0 geometry via get_geometry helper
+        let can_geom = can0.get_geometry().unwrap();
+        let box_geom = can_geom.get_box().unwrap();
+        let size = box_geom.parse_size().unwrap();
+        assert!((size[0] - 0.005).abs() < 0.0001);
+
+        // Check parse_pose uses fallback_visual
+        let can_pose_via_port = can0.parse_pose().unwrap();
+        assert!((can_pose_via_port.x - (-0.0225)).abs() < 0.0001);
+
+        // Check UART0 - serial with baud rate
+        let uart0 = &comp.port[2];
+        assert_eq!(uart0.name, "UART0");
+        assert_eq!(uart0.port_type, "serial");
+        let uart_caps = uart0.capabilities.as_ref().unwrap();
+        let baud = uart_caps.baud.as_ref().unwrap();
+        assert_eq!(baud.value, "115200");
+        assert_eq!(baud.unit, Some("baud".to_string()));
+        assert_eq!(uart_caps.protocol, vec!["RS-232".to_string()]);
+    }
+
+    #[test]
+    fn test_port_legacy_compatibility() {
+        // Test that legacy port format still works (backwards compatibility)
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="2.0">
+  <comp name="test" role="sensor">
+    <port name="ETH0" type="ethernet">
+      <pose>0.022 -0.015 -0.009 0 0 0</pose>
+      <geometry>
+        <box><size>0.008 0.006 0.003</size></box>
+      </geometry>
+    </port>
+  </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml).unwrap();
+        let port = &hcdf.comp[0].port[0];
+
+        // Legacy pose should work via parse_pose
+        let pose = port.parse_pose().unwrap();
+        assert!((pose.x - 0.022).abs() < 0.0001);
+
+        // Legacy geometry should work via get_geometry
+        let geom = port.get_geometry().unwrap();
+        let box_geom = geom.get_box().unwrap();
+        let size = box_geom.parse_size().unwrap();
+        assert!((size[0] - 0.008).abs() < 0.0001);
+
+        // No fallback_visual in legacy format
+        assert!(port.fallback_visual.is_none());
+    }
+
+    #[test]
+    fn test_parse_port_power_capabilities() {
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="2.1">
+  <comp name="test" role="compute">
+    <!-- Power input port with voltage range and max draw -->
+    <port name="pwr_in" type="POWER" visual="main_board" mesh="pwr">
+      <capabilities>
+        <voltage unit="V" min="7" max="28">12</voltage>
+        <current unit="A" max="3"/>
+        <power unit="W" max="36"/>
+        <connector>XT30</connector>
+      </capabilities>
+    </port>
+
+    <!-- Ethernet with PoDL power -->
+    <port name="eth_podl" type="ethernet" visual="board" mesh="eth">
+      <capabilities>
+        <speed unit="Mbps">1000</speed>
+        <standard>1000BASE-T1</standard>
+        <protocol>PoDL</protocol>
+        <voltage unit="V" min="12" max="48">24</voltage>
+        <power unit="W" max="50"/>
+      </capabilities>
+    </port>
+
+    <!-- Battery output port with capacity -->
+    <port name="bat_out" type="POWER" visual="battery" mesh="output">
+      <capabilities>
+        <voltage unit="V" min="10.5" max="12.6">12</voltage>
+        <current unit="A" max="10"/>
+        <power unit="W" max="120"/>
+        <capacity unit="Wh">55.5</capacity>
+        <connector>XT60</connector>
+      </capabilities>
+    </port>
+  </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml).unwrap();
+        let comp = &hcdf.comp[0];
+        assert_eq!(comp.port.len(), 3);
+
+        // Check power input port
+        let pwr_in = &comp.port[0];
+        assert_eq!(pwr_in.name, "pwr_in");
+        assert_eq!(pwr_in.port_type, "POWER");
+        let caps = pwr_in.capabilities.as_ref().unwrap();
+
+        // Check voltage with range
+        let voltage = caps.voltage.as_ref().unwrap();
+        assert_eq!(voltage.unit, Some("V".to_string()));
+        assert_eq!(voltage.min, Some(7.0));
+        assert_eq!(voltage.max, Some(28.0));
+        assert_eq!(voltage.value, Some("12".to_string()));
+        assert_eq!(voltage.to_display_string(), "12V (7-28V)");
+
+        // Check current
+        let current = caps.current.as_ref().unwrap();
+        assert_eq!(current.unit, Some("A".to_string()));
+        assert_eq!(current.max, Some(3.0));
+        assert_eq!(current.to_display_string(), "3A max");
+
+        // Check power
+        let power = caps.power.as_ref().unwrap();
+        assert_eq!(power.unit, Some("W".to_string()));
+        assert_eq!(power.max, Some(36.0));
+        assert_eq!(power.to_display_string(), "36W max");
+
+        // Check connector
+        assert_eq!(caps.connector, Some("XT30".to_string()));
+
+        // Check Ethernet with PoDL - has both data and power capabilities
+        let eth_podl = &comp.port[1];
+        assert_eq!(eth_podl.name, "eth_podl");
+        let eth_caps = eth_podl.capabilities.as_ref().unwrap();
+        // Data capabilities
+        assert_eq!(eth_caps.speed.as_ref().unwrap().value, "1000");
+        assert_eq!(eth_caps.standard, Some("1000BASE-T1".to_string()));
+        assert_eq!(eth_caps.protocol, vec!["PoDL".to_string()]);
+        // Power capabilities
+        let eth_voltage = eth_caps.voltage.as_ref().unwrap();
+        assert_eq!(eth_voltage.to_display_string(), "24V (12-48V)");
+
+        // Check battery port with capacity
+        let bat_out = &comp.port[2];
+        let bat_caps = bat_out.capabilities.as_ref().unwrap();
+        let capacity = bat_caps.capacity.as_ref().unwrap();
+        assert_eq!(capacity.value, "55.5");
+        assert_eq!(capacity.unit, Some("Wh".to_string()));
+        assert_eq!(bat_caps.connector, Some("XT60".to_string()));
+    }
+
+    #[test]
+    fn test_parse_antenna_with_capabilities_and_fallback_visual() {
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="2.1">
+  <comp name="rtk-gnss" role="sensor">
+    <description>RTK GNSS assembly</description>
+
+    <!-- Antenna with mesh reference and capabilities -->
+    <antenna name="GNSS0" type="gnss" visual="board" mesh="GNSS_ANT">
+      <capabilities>
+        <band>L1</band>
+        <band>L2</band>
+        <band>L5</band>
+        <gain unit="dBi">3.5</gain>
+        <polarization>RHCP</polarization>
+      </capabilities>
+    </antenna>
+
+    <!-- Tri-radio antenna with fallback visual -->
+    <antenna name="WIFI0" type="wifi">
+      <capabilities>
+        <band>2.4 GHz</band>
+        <band>5 GHz</band>
+        <gain unit="dBi">2.0</gain>
+        <standard>802.11ax</standard>
+        <protocol>WPA3</protocol>
+      </capabilities>
+      <fallback_visual>
+        <pose>0.01 0.02 0.005 0 0 0</pose>
+        <geometry>
+          <cylinder><radius>0.002</radius><length>0.015</length></cylinder>
+        </geometry>
+      </fallback_visual>
+    </antenna>
+
+    <!-- 802.15.4 antenna with multiple standards and protocols -->
+    <antenna name="WPAN0" type="802.15.4">
+      <capabilities>
+        <band>2.4 GHz</band>
+        <standard>Bluetooth 5.4</standard>
+        <standard>802.15.4</standard>
+        <protocol>Thread</protocol>
+        <protocol>6LoWPAN</protocol>
+        <protocol>Matter</protocol>
+      </capabilities>
+      <fallback_visual>
+        <pose>-0.005 0.01 0.003 0 0 0</pose>
+        <geometry>
+          <box><size>0.003 0.002 0.001</size></box>
+        </geometry>
+      </fallback_visual>
+    </antenna>
+
+  </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml).unwrap();
+        assert_eq!(hcdf.version, "2.1");
+        assert_eq!(hcdf.comp.len(), 1);
+
+        let comp = &hcdf.comp[0];
+        assert_eq!(comp.antenna.len(), 3);
+
+        // Check GNSS0 - mesh reference with capabilities
+        let gnss0 = &comp.antenna[0];
+        assert_eq!(gnss0.name, "GNSS0");
+        assert_eq!(gnss0.antenna_type, "gnss");
+        assert_eq!(gnss0.visual, Some("board".to_string()));
+        assert_eq!(gnss0.mesh, Some("GNSS_ANT".to_string()));
+        assert!(gnss0.has_mesh_reference());
+        assert!(gnss0.fallback_visual.is_none());
+
+        // Check GNSS0 capabilities - multiple bands
+        let gnss_caps = gnss0.capabilities.as_ref().unwrap();
+        assert_eq!(gnss_caps.band, vec!["L1".to_string(), "L2".to_string(), "L5".to_string()]);
+        let gain = gnss_caps.gain.as_ref().unwrap();
+        assert_eq!(gain.value, "3.5");
+        assert_eq!(gain.unit, Some("dBi".to_string()));
+        assert_eq!(gnss_caps.polarization, Some("RHCP".to_string()));
+
+        // Check WIFI0 - tri-radio with standards and protocols
+        let wifi0 = &comp.antenna[1];
+        assert_eq!(wifi0.name, "WIFI0");
+        assert_eq!(wifi0.antenna_type, "wifi");
+        assert!(!wifi0.has_mesh_reference());
+
+        // Check WIFI0 capabilities
+        let wifi_caps = wifi0.capabilities.as_ref().unwrap();
+        assert_eq!(wifi_caps.band, vec!["2.4 GHz".to_string(), "5 GHz".to_string()]);
+        assert_eq!(wifi_caps.standard, vec!["802.11ax".to_string()]);
+        assert_eq!(wifi_caps.protocol, vec!["WPA3".to_string()]);
+
+        // Check WIFI0 fallback visual
+        let wifi_fv = wifi0.fallback_visual.as_ref().unwrap();
+        let wifi_pose = wifi_fv.parse_pose().unwrap();
+        assert!((wifi_pose.x - 0.01).abs() < 0.0001);
+        assert!((wifi_pose.y - 0.02).abs() < 0.0001);
+
+        // Check WIFI0 geometry via get_geometry helper
+        let wifi_geom = wifi0.get_geometry().unwrap();
+        let cyl = wifi_geom.cylinder.as_ref().unwrap();
+        assert!((cyl.radius - 0.002).abs() < 0.0001);
+        assert!((cyl.length - 0.015).abs() < 0.0001);
+
+        // Check parse_pose uses fallback_visual
+        let wifi_pose_via_antenna = wifi0.parse_pose().unwrap();
+        assert!((wifi_pose_via_antenna.x - 0.01).abs() < 0.0001);
+
+        // Check WPAN0 - 802.15.4 with multiple standards and protocols
+        let wpan0 = &comp.antenna[2];
+        assert_eq!(wpan0.name, "WPAN0");
+        assert_eq!(wpan0.antenna_type, "802.15.4");
+        let wpan_caps = wpan0.capabilities.as_ref().unwrap();
+        assert_eq!(wpan_caps.band, vec!["2.4 GHz".to_string()]);
+        assert_eq!(wpan_caps.standard, vec!["Bluetooth 5.4".to_string(), "802.15.4".to_string()]);
+        assert_eq!(wpan_caps.protocol, vec!["Thread".to_string(), "6LoWPAN".to_string(), "Matter".to_string()]);
+        let wpan_geom = wpan0.get_geometry().unwrap();
+        let box_geom = wpan_geom.get_box().unwrap();
+        let size = box_geom.parse_size().unwrap();
+        assert!((size[0] - 0.003).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_antenna_legacy_compatibility() {
+        // Test that legacy antenna format still works (backwards compatibility)
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="2.0">
+  <comp name="test" role="sensor">
+    <antenna name="GNSS0" type="gnss">
+      <pose>0.01 0.02 0.005 0 0 0</pose>
+      <geometry>
+        <cylinder><radius>0.005</radius><length>0.01</length></cylinder>
+      </geometry>
+    </antenna>
+  </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml).unwrap();
+        let antenna = &hcdf.comp[0].antenna[0];
+
+        // Legacy pose should work via parse_pose
+        let pose = antenna.parse_pose().unwrap();
+        assert!((pose.x - 0.01).abs() < 0.0001);
+
+        // Legacy geometry should work via get_geometry
+        let geom = antenna.get_geometry().unwrap();
+        let cyl = geom.cylinder.as_ref().unwrap();
+        assert!((cyl.radius - 0.005).abs() < 0.0001);
+
+        // No fallback_visual in legacy format
+        assert!(antenna.fallback_visual.is_none());
+    }
 }
+
+    #[test]
+    fn test_parse_interleaved_ports_and_antennas() {
+        // Test with ports interleaved with antennas - this is common in real HCDF files
+        // quick_xml requires special handling for non-consecutive elements of the same type
+        let xml = r#"<?xml version='1.0'?>
+<hcdf version="2.0">
+  <comp name="test" role="compute">
+    <port name="eth0" type="ethernet" visual="board" mesh="rj45">
+      <capabilities><speed unit="Mbps">1000</speed></capabilities>
+    </port>
+    <port name="eth1" type="ethernet" visual="board" mesh="port1">
+      <capabilities><speed unit="Mbps">100</speed></capabilities>
+    </port>
+    <antenna name="wifi" type="wifi" visual="board" mesh="ant0">
+      <capabilities><band>2.4 GHz</band></capabilities>
+    </antenna>
+    <port name="can0" type="CAN" visual="board" mesh="can0">
+      <capabilities><bitrate unit="bps">500000</bitrate></capabilities>
+    </port>
+    <sensor name="imu">
+      <inertial type="accel_gyro">
+        <pose>0 0 0 0 0 0</pose>
+      </inertial>
+    </sensor>
+    <visual name="board">
+      <pose>0 0 0 0 0 0</pose>
+      <model href="test.glb" sha=""/>
+    </visual>
+  </comp>
+</hcdf>"#;
+
+        let hcdf = Hcdf::from_xml(xml);
+        assert!(hcdf.is_ok(), "Failed to parse: {:?}", hcdf.err());
+
+        let hcdf = hcdf.unwrap();
+        let comp = &hcdf.comp[0];
+
+        assert_eq!(comp.port.len(), 3);
+        assert_eq!(comp.antenna.len(), 1);
+        assert_eq!(comp.sensor.len(), 1);
+        assert_eq!(comp.visual.len(), 1);
+    }

@@ -3,9 +3,11 @@
 use bevy::asset::LoadState;
 use bevy::ecs::schedule::ApplyDeferred;
 use bevy::prelude::*;
+use bevy_picking::mesh_picking::ray_cast::RayCastBackfaces;
+use bevy_picking::prelude::Pickable;
 use std::collections::HashMap;
 
-use crate::app::{AxisAlignData, DeviceRegistry, DeviceStatus, FrameVisibility, GeometryData, PortData, SensorData, VisualData};
+use crate::app::{AntennaCapabilitiesData, AntennaData, AxisAlignData, DeviceRegistry, DeviceStatus, FrameVisibility, GeometryData, PortCapabilitiesData, PortData, SensorData, VisualData};
 use crate::scene::DeviceEntity;
 use crate::ui::HcdfBaseUrl;
 
@@ -85,6 +87,8 @@ pub struct PortEntity {
     pub port_name: String,
     /// Port type
     pub port_type: String,
+    /// Port capabilities (speed, bitrate, protocol, etc.)
+    pub capabilities: Option<PortCapabilitiesData>,
 }
 
 /// Component marking a port geometry entity (highlight box)
@@ -94,6 +98,28 @@ pub struct PortGeometryEntity {
     pub device_id: String,
     /// Port name
     pub port_name: String,
+}
+
+/// Component marking an antenna visualization entity
+#[derive(Component)]
+pub struct AntennaEntity {
+    /// Parent device ID
+    pub device_id: String,
+    /// Antenna name
+    pub antenna_name: String,
+    /// Antenna type
+    pub antenna_type: String,
+    /// Antenna capabilities (frequency, gain, protocol, etc.)
+    pub capabilities: Option<AntennaCapabilitiesData>,
+}
+
+/// Component marking an antenna geometry entity (highlight shape)
+#[derive(Component)]
+pub struct AntennaGeometryEntity {
+    /// Parent device ID
+    pub device_id: String,
+    /// Antenna name
+    pub antenna_name: String,
 }
 
 /// Component to tag GLTF mesh nodes with their name for port highlighting
@@ -111,6 +137,8 @@ pub struct PortMeshTarget {
     pub port_name: String,
     /// Port type for coloring
     pub port_type: String,
+    /// Port capabilities (speed, bitrate, protocol, etc.)
+    pub capabilities: Option<PortCapabilitiesData>,
 }
 
 pub struct ModelsPlugin;
@@ -120,6 +148,7 @@ impl Plugin for ModelsPlugin {
         app.init_resource::<ModelCache>()
             .init_resource::<SensorPortCache>()
             .init_resource::<PendingPortMeshes>()
+            .init_resource::<PendingAntennaMeshes>()
             .add_systems(Update, load_models)
             .add_systems(Update, sync_device_entities.after(load_models))
             .add_systems(Update, sync_sensor_entities.after(sync_device_entities))
@@ -128,6 +157,7 @@ impl Plugin for ModelsPlugin {
                 tag_gltf_node_names.after(sync_device_entities),
                 ApplyDeferred,
                 link_port_meshes,
+                link_antenna_meshes,
             ).chain())
             .add_systems(Update, update_visual_visibility.after(sync_device_entities))
             .add_systems(Update, update_sensor_axis_visibility.after(sync_sensor_entities))
@@ -135,7 +165,10 @@ impl Plugin for ModelsPlugin {
             .add_systems(Update, update_sensor_fov_visibility.after(sync_sensor_entities))
             .add_systems(Update, update_sensor_fov_hover_alpha.after(update_sensor_fov_visibility))
             .add_systems(Update, update_port_visibility.after(sync_port_entities))
-            .add_systems(Update, update_port_mesh_highlighting.after(link_port_meshes));
+            .add_systems(Update, update_port_mesh_highlighting.after(link_port_meshes))
+            .add_systems(Update, update_antenna_visibility.after(sync_port_entities))
+            .add_systems(Update, update_antenna_mesh_highlighting.after(link_antenna_meshes))
+            .add_systems(Update, debug_port_mesh_picking_status.after(link_port_meshes));
     }
 }
 
@@ -147,13 +180,15 @@ pub struct ModelCache {
     pub ready: HashMap<String, bool>,
 }
 
-/// Cache to track which sensors/ports have been spawned for each device
+/// Cache to track which sensors/ports/antennas have been spawned for each device
 #[derive(Resource, Default)]
 pub struct SensorPortCache {
     /// Set of (device_id, sensor_name) pairs that have been spawned
     pub spawned_sensors: std::collections::HashSet<(String, String)>,
     /// Set of (device_id, port_name) pairs that have been spawned
     pub spawned_ports: std::collections::HashSet<(String, String)>,
+    /// Set of (device_id, antenna_name) pairs that have been spawned
+    pub spawned_antennas: std::collections::HashSet<(String, String)>,
 }
 
 /// Pending port mesh assignment
@@ -166,6 +201,8 @@ pub struct PendingPortMesh {
     /// Mesh node name within the visual (e.g., "port_eth0")
     pub mesh_name: String,
     pub port_type: String,
+    /// Port capabilities (speed, bitrate, protocol, etc.)
+    pub capabilities: Option<PortCapabilitiesData>,
 }
 
 /// Tracks pending port mesh assignments
@@ -173,6 +210,39 @@ pub struct PendingPortMesh {
 #[derive(Resource, Default)]
 pub struct PendingPortMeshes {
     pub pending: Vec<PendingPortMesh>,
+}
+
+/// Pending antenna mesh assignment
+#[derive(Debug, Clone)]
+pub struct PendingAntennaMesh {
+    pub device_id: String,
+    pub antenna_name: String,
+    /// Visual name containing the mesh (e.g., "board")
+    pub visual_name: Option<String>,
+    /// Mesh node name within the visual (e.g., "gnss_antenna")
+    pub mesh_name: String,
+    pub antenna_type: String,
+    /// Antenna capabilities (frequency, gain, protocol, etc.)
+    pub capabilities: Option<AntennaCapabilitiesData>,
+}
+
+/// Tracks pending antenna mesh assignments
+#[derive(Resource, Default)]
+pub struct PendingAntennaMeshes {
+    pub pending: Vec<PendingAntennaMesh>,
+}
+
+/// Component to mark a mesh as being an antenna target for highlighting
+#[derive(Component, Debug)]
+pub struct AntennaMeshTarget {
+    /// Parent device ID
+    pub device_id: String,
+    /// Antenna name this mesh represents
+    pub antenna_name: String,
+    /// Antenna type for coloring
+    pub antenna_type: String,
+    /// Antenna capabilities (frequency, gain, protocol, etc.)
+    pub capabilities: Option<AntennaCapabilitiesData>,
 }
 
 /// Check loading state and extract scenes from loaded GLTFs
@@ -481,6 +551,7 @@ fn sync_device_entities(
 
 /// Normalize model path for asset loading
 /// If base_url is provided and path is relative, prepend the base URL
+/// For local files (base_url is None), use relative path for local loading
 fn normalize_model_path(path: &str, base_url: &Option<String>) -> String {
     // If it's an absolute URL, return as-is (Bevy can load from HTTP)
     if path.starts_with("http://") || path.starts_with("https://") {
@@ -500,12 +571,17 @@ fn normalize_model_path(path: &str, base_url: &Option<String>) -> String {
         return full_url;
     }
 
-    // Local path: ensure it starts with "models/"
-    if path.starts_with("models/") {
+    // No base URL (local file upload) - use local relative path
+    // This works for:
+    // - Local development: models/ directory symlinked from hcdf_models
+    // - GitHub Pages: models hosted alongside the viewer (if uploaded)
+    let local_path = if path.starts_with("models/") {
         path.to_string()
     } else {
         format!("models/{}", path)
-    }
+    };
+    tracing::info!("Using local model path: {} -> {}", path, local_path);
+    local_path
 }
 
 /// Convert visual pose to Transform
@@ -1067,6 +1143,7 @@ fn sync_port_entities(
     device_query: Query<(Entity, &DeviceEntity)>,
     mut sensor_port_cache: ResMut<SensorPortCache>,
     mut pending_port_meshes: ResMut<PendingPortMeshes>,
+    mut pending_antenna_meshes: ResMut<PendingAntennaMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1097,6 +1174,7 @@ fn sync_port_entities(
                     visual_name: port.visual_name.clone(),
                     mesh_name: mesh_name.clone(),
                     port_type: port.port_type.clone(),
+                    capabilities: port.capabilities.clone(),
                 });
                 tracing::info!("Registered pending port mesh: {} -> {} (visual: {:?}) for device {}", port.name, mesh_name, port.visual_name, device.id);
             } else {
@@ -1133,6 +1211,60 @@ fn sync_port_entities(
                 }
             }
         }
+
+        // Spawn antenna visualizations
+        for antenna in &device.antennas {
+            let cache_key = (device.id.clone(), antenna.name.clone());
+
+            if sensor_port_cache.spawned_antennas.contains(&cache_key) {
+                continue;
+            }
+
+            sensor_port_cache.spawned_antennas.insert(cache_key);
+
+            // If antenna has mesh_name, register it for GLTF mesh linking (no fallback geometry)
+            if let Some(ref mesh_name) = antenna.mesh_name {
+                pending_antenna_meshes.pending.push(PendingAntennaMesh {
+                    device_id: device.id.clone(),
+                    antenna_name: antenna.name.clone(),
+                    visual_name: antenna.visual_name.clone(),
+                    mesh_name: mesh_name.clone(),
+                    antenna_type: antenna.antenna_type.clone(),
+                    capabilities: antenna.capabilities.clone(),
+                });
+                tracing::info!("Registered pending antenna mesh: {} -> {} (visual: {:?}) for device {}", antenna.name, mesh_name, antenna.visual_name, device.id);
+            } else {
+                // No mesh_name - use geometry-based highlighting
+                let antenna_transform = pose_to_transform(antenna.pose);
+
+                // Spawn antenna highlight geometry
+                if let Some(ref geometry) = antenna.geometry {
+                    let antenna_entity = spawn_antenna_geometry(
+                        &mut commands,
+                        &mut meshes,
+                        &mut materials,
+                        &device.id,
+                        antenna,
+                        geometry,
+                        antenna_transform,
+                    );
+                    commands.entity(parent_entity).add_child(antenna_entity);
+                } else {
+                    // No geometry - spawn a default small cylinder (antenna shape)
+                    let default_geometry = GeometryData::Cylinder { radius: 0.002, length: 0.01 };
+                    let antenna_entity = spawn_antenna_geometry(
+                        &mut commands,
+                        &mut meshes,
+                        &mut materials,
+                        &device.id,
+                        antenna,
+                        &default_geometry,
+                        antenna_transform,
+                    );
+                    commands.entity(parent_entity).add_child(antenna_entity);
+                }
+            }
+        }
     }
 }
 
@@ -1154,7 +1286,9 @@ fn spawn_port_geometry(
         "i2c" => Color::srgba(0.2, 0.8, 0.8, 0.4),      // Cyan
         "uart" => Color::srgba(0.8, 0.4, 0.2, 0.4),     // Orange
         "usb" => Color::srgba(0.2, 0.4, 0.8, 0.4),      // Blue
-        _ => Color::srgba(0.5, 0.5, 0.5, 0.4),          // Gray
+        "power" => Color::srgba(1.0, 0.2, 0.2, 0.4),    // Vibrant red
+        "card" => Color::srgba(0.7, 0.7, 0.4, 0.4),     // Tan/khaki
+        _ => Color::srgba(1.0, 0.0, 1.0, 0.4),          // Bright magenta (unknown)
     };
 
     let port_material = materials.add(StandardMaterial {
@@ -1187,10 +1321,72 @@ fn spawn_port_geometry(
             device_id: device_id.to_string(),
             port_name: port.name.clone(),
             port_type: port.port_type.clone(),
+            capabilities: port.capabilities.clone(),
         },
         PortGeometryEntity {
             device_id: device_id.to_string(),
             port_name: port.name.clone(),
+        },
+    )).id()
+}
+
+/// Spawn an antenna geometry as a transparent highlight
+fn spawn_antenna_geometry(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    device_id: &str,
+    antenna: &AntennaData,
+    geometry: &GeometryData,
+    transform: Transform,
+) -> Entity {
+    // Color based on antenna type
+    let antenna_color = match antenna.antenna_type.to_lowercase().as_str() {
+        "gnss" | "gps" => Color::srgba(0.2, 0.6, 1.0, 0.4),      // Light blue
+        "wifi" | "wlan" => Color::srgba(0.4, 0.8, 0.4, 0.4),     // Light green
+        "bluetooth" | "bt" => Color::srgba(0.4, 0.4, 1.0, 0.4),   // Blue
+        "lora" => Color::srgba(1.0, 0.6, 0.2, 0.4),               // Orange
+        "cellular" | "lte" | "5g" => Color::srgba(1.0, 0.4, 0.4, 0.4), // Red-orange
+        "uwb" => Color::srgba(0.8, 0.4, 0.8, 0.4),                // Purple
+        "nfc" => Color::srgba(0.78, 0.39, 0.78, 0.4),             // Purple
+        _ => Color::srgba(1.0, 0.0, 0.0, 0.4),                    // Red (unknown)
+    };
+
+    let antenna_material = materials.add(StandardMaterial {
+        base_color: antenna_color,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        ..default()
+    });
+
+    let mesh = match geometry {
+        GeometryData::Box { size } => {
+            meshes.add(Cuboid::new(size[0] as f32, size[1] as f32, size[2] as f32))
+        }
+        GeometryData::Cylinder { radius, length } => {
+            meshes.add(Cylinder::new(*radius as f32, *length as f32))
+        }
+        GeometryData::Sphere { radius } => {
+            meshes.add(Sphere::new(*radius as f32))
+        }
+        _ => meshes.add(Cylinder::new(0.002, 0.01)), // Default cylinder for antenna
+    };
+
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(antenna_material),
+        transform,
+        Visibility::Hidden,
+        ExcludeFromBounds,
+        AntennaEntity {
+            device_id: device_id.to_string(),
+            antenna_name: antenna.name.clone(),
+            antenna_type: antenna.antenna_type.clone(),
+            capabilities: antenna.capabilities.clone(),
+        },
+        AntennaGeometryEntity {
+            device_id: device_id.to_string(),
+            antenna_name: antenna.name.clone(),
         },
     )).id()
 }
@@ -1291,6 +1487,38 @@ fn update_port_visibility(
         // Check if this port is hovered
         let port_key = format!("{}:{}", port.device_id, port.port_name);
         let is_hovered = frame_visibility.hovered_port.as_ref() == Some(&port_key);
+
+        // Update material alpha based on hover state
+        if let Some(material) = materials.get_mut(&material_handle.0) {
+            let base_alpha = 0.4;
+            let hovered_alpha = 0.9;
+            let target_alpha = if is_hovered { hovered_alpha } else { base_alpha };
+
+            // Get current color and update alpha
+            let mut color = material.base_color.to_srgba();
+            color.alpha = target_alpha;
+            material.base_color = Color::srgba(color.red, color.green, color.blue, color.alpha);
+        }
+    }
+}
+
+/// Update antenna visibility and highlighting based on device settings and hover state
+fn update_antenna_visibility(
+    frame_visibility: Res<FrameVisibility>,
+    mut antennas: Query<(&AntennaEntity, &mut Visibility, &MeshMaterial3d<StandardMaterial>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (antenna, mut visibility, material_handle) in antennas.iter_mut() {
+        let should_show = frame_visibility.show_antennas_for(&antenna.device_id);
+        *visibility = if should_show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+
+        // Check if this antenna is hovered
+        let antenna_key = format!("{}:{}", antenna.device_id, antenna.antenna_name);
+        let is_hovered = frame_visibility.hovered_antenna.as_ref() == Some(&antenna_key);
 
         // Update material alpha based on hover state
         if let Some(material) = materials.get_mut(&material_handle.0) {
@@ -1446,7 +1674,7 @@ fn link_port_meshes(
     visual_query: Query<(Entity, &VisualEntity)>,
     children_query: Query<&Children>,
     node_name_query: Query<(Entity, &GltfNodeName)>,
-    mesh_query: Query<Entity, With<Mesh3d>>,
+    mesh_query: Query<(Entity, &Mesh3d)>,
 ) {
     if pending.pending.is_empty() {
         return;
@@ -1464,11 +1692,11 @@ fn link_port_meshes(
         .map(|(e, v)| ((v.device_id.clone(), v.visual_name.clone()), (e, v.model_path.clone())))
         .collect();
 
-    // Build a map of all node names to entities for quick lookup
-    let node_map: HashMap<String, Entity> = node_name_query
-        .iter()
-        .map(|(e, n)| (n.name.clone(), e))
-        .collect();
+    // Build a map of node names to ALL entities with that name (multiple models may share names)
+    let mut node_map: HashMap<String, Vec<Entity>> = HashMap::new();
+    for (entity, node_name) in node_name_query.iter() {
+        node_map.entry(node_name.name.clone()).or_default().push(entity);
+    }
 
     // If no GLTF nodes have been tagged yet, wait for next frame
     // This handles the timing where visuals are spawned but nodes aren't tagged yet
@@ -1477,6 +1705,8 @@ fn link_port_meshes(
     }
 
     // Process pending port meshes
+    // Track which mesh entities have been used to detect conflicts
+    let mut mesh_entity_to_port: HashMap<Entity, String> = HashMap::new();
     let mut remaining = Vec::new();
     for port_mesh in pending.pending.drain(..) {
         // Find the device entity
@@ -1501,29 +1731,58 @@ fn link_port_meshes(
             (device_entity, None)
         };
 
-        // Look for node with matching name in the search root's hierarchy
-        if let Some(&node_entity) = node_map.get(&port_mesh.mesh_name) {
-            // Check if this node is a descendant of the search root
-            if is_descendant_of(node_entity, search_root, &children_query) {
+        // Look for nodes with matching name, find the one that's a descendant of search_root
+        if let Some(node_entities) = node_map.get(&port_mesh.mesh_name) {
+            // Find the node that is a descendant of the search root
+            let matching_node = node_entities.iter().find(|&&node_entity| {
+                is_descendant_of(node_entity, search_root, &children_query)
+            });
+
+            if let Some(&node_entity) = matching_node {
                 // Find mesh entities - either this node has a mesh, or check children
-                let mesh_entity = if mesh_query.get(node_entity).is_ok() {
+                let node_has_mesh = mesh_query.get(node_entity).is_ok();
+                let mesh_entity = if node_has_mesh {
                     // The node itself has a mesh
+                    tracing::warn!(
+                        "Port '{}' ({}): mesh is ON the node entity {:?}",
+                        port_mesh.port_name, port_mesh.mesh_name, node_entity
+                    );
                     Some(node_entity)
                 } else {
                     // Look for first child with a mesh
-                    find_child_mesh(node_entity, &children_query, &mesh_query)
+                    let child_mesh = find_child_mesh(node_entity, &children_query, &mesh_query);
+                    tracing::warn!(
+                        "Port '{}' ({}): mesh is CHILD entity {:?} of node {:?}",
+                        port_mesh.port_name, port_mesh.mesh_name, child_mesh, node_entity
+                    );
+                    child_mesh
                 };
 
                 if let Some(mesh_entity) = mesh_entity {
-                    // Tag this mesh as a port target
-                    commands.entity(mesh_entity).insert(PortMeshTarget {
-                        device_id: port_mesh.device_id.clone(),
-                        port_name: port_mesh.port_name.clone(),
-                        port_type: port_mesh.port_type.clone(),
-                    });
-                    tracing::debug!(
-                        "Linked port {} to mesh entity {:?} (node {:?}, visual: {:?}) for device {}",
-                        port_mesh.port_name, mesh_entity, node_entity, port_mesh.visual_name, port_mesh.device_id
+                    // Check if this mesh entity is already used by another port
+                    if let Some(existing_port) = mesh_entity_to_port.get(&mesh_entity) {
+                        tracing::warn!(
+                            "CONFLICT: Port '{}' shares mesh entity {:?} with port '{}' - only last port will be hoverable! (mesh_name: '{}', node: {:?})",
+                            port_mesh.port_name, mesh_entity, existing_port, port_mesh.mesh_name, node_entity
+                        );
+                    }
+                    mesh_entity_to_port.insert(mesh_entity, port_mesh.port_name.clone());
+
+                    // Tag the actual mesh for highlighting (material changes) and picking
+                    // Start with IGNORE since ports are hidden by default - update_port_mesh_highlighting will enable when visible
+                    commands.entity(mesh_entity).insert((
+                        PortMeshTarget {
+                            device_id: port_mesh.device_id.clone(),
+                            port_name: port_mesh.port_name.clone(),
+                            port_type: port_mesh.port_type.clone(),
+                            capabilities: port_mesh.capabilities.clone(),
+                        },
+                        Pickable::IGNORE,
+                    ));
+
+                    tracing::info!(
+                        "Linked port '{}' to mesh {:?} (node {:?}, mesh_name: '{}', visual: {:?}) for device {}",
+                        port_mesh.port_name, mesh_entity, node_entity, port_mesh.mesh_name, port_mesh.visual_name, port_mesh.device_id
                     );
                 } else {
                     tracing::warn!(
@@ -1533,8 +1792,8 @@ fn link_port_meshes(
                 }
             } else {
                 tracing::warn!(
-                    "Port {} node '{}' found but NOT a descendant of visual (visual: {:?}, model: {:?}, device: {})",
-                    port_mesh.port_name, port_mesh.mesh_name, port_mesh.visual_name, model_path, port_mesh.device_id
+                    "Port {} node '{}' found {} times but none are descendants of visual (visual: {:?}, model: {:?}, device: {})",
+                    port_mesh.port_name, port_mesh.mesh_name, node_entities.len(), port_mesh.visual_name, model_path, port_mesh.device_id
                 );
             }
         } else {
@@ -1549,6 +1808,119 @@ fn link_port_meshes(
                 tracing::warn!(
                     "Port {} mesh '{}' not found in visual's scene graph (visual: {:?}, model: {:?}, device: {})",
                     port_mesh.port_name, port_mesh.mesh_name, port_mesh.visual_name, model_path, port_mesh.device_id
+                );
+            }
+        }
+    }
+
+    pending.pending = remaining;
+}
+
+/// Link pending antenna meshes to their GLTF mesh entities
+/// Similar to link_port_meshes but for antennas
+fn link_antenna_meshes(
+    mut commands: Commands,
+    mut pending: ResMut<PendingAntennaMeshes>,
+    device_query: Query<(Entity, &DeviceEntity)>,
+    visual_query: Query<(Entity, &VisualEntity)>,
+    children_query: Query<&Children>,
+    node_name_query: Query<(Entity, &GltfNodeName)>,
+    mesh_query: Query<(Entity, &Mesh3d)>,
+) {
+    if pending.pending.is_empty() {
+        return;
+    }
+
+    // Build device entity map
+    let device_entities: HashMap<String, Entity> = device_query
+        .iter()
+        .map(|(e, d)| (d.device_id.clone(), e))
+        .collect();
+
+    // Build a map of (device_id, visual_name) -> (visual entity, model_path)
+    let visual_entities: HashMap<(String, String), (Entity, Option<String>)> = visual_query
+        .iter()
+        .map(|(e, v)| ((v.device_id.clone(), v.visual_name.clone()), (e, v.model_path.clone())))
+        .collect();
+
+    // Build a map of node names to ALL entities with that name
+    let mut node_map: HashMap<String, Vec<Entity>> = HashMap::new();
+    for (entity, node_name) in node_name_query.iter() {
+        node_map.entry(node_name.name.clone()).or_default().push(entity);
+    }
+
+    if node_map.is_empty() {
+        return;
+    }
+
+    let mut remaining = Vec::new();
+    for antenna_mesh in pending.pending.drain(..) {
+        let Some(&device_entity) = device_entities.get(&antenna_mesh.device_id) else {
+            remaining.push(antenna_mesh);
+            continue;
+        };
+
+        let (search_root, model_path) = if let Some(ref visual_name) = antenna_mesh.visual_name {
+            let key = (antenna_mesh.device_id.clone(), visual_name.clone());
+            if let Some((visual_entity, model_path)) = visual_entities.get(&key) {
+                (*visual_entity, model_path.clone())
+            } else {
+                remaining.push(antenna_mesh);
+                continue;
+            }
+        } else {
+            (device_entity, None)
+        };
+
+        if let Some(node_entities) = node_map.get(&antenna_mesh.mesh_name) {
+            let matching_node = node_entities.iter().find(|&&node_entity| {
+                is_descendant_of(node_entity, search_root, &children_query)
+            });
+
+            if let Some(&node_entity) = matching_node {
+                let mesh_entity = if mesh_query.get(node_entity).is_ok() {
+                    Some(node_entity)
+                } else {
+                    find_child_mesh(node_entity, &children_query, &mesh_query)
+                };
+
+                if let Some(mesh_entity) = mesh_entity {
+                    // Add RayCastBackfaces to ensure picking works regardless of mesh face orientation
+                    // Start with IGNORE since antennas are hidden by default - update_antenna_mesh_highlighting will enable when visible
+                    commands.entity(mesh_entity).insert((
+                        AntennaMeshTarget {
+                            device_id: antenna_mesh.device_id.clone(),
+                            antenna_name: antenna_mesh.antenna_name.clone(),
+                            antenna_type: antenna_mesh.antenna_type.clone(),
+                            capabilities: antenna_mesh.capabilities.clone(),
+                        },
+                        RayCastBackfaces,
+                        Pickable::IGNORE,
+                    ));
+                    tracing::debug!(
+                        "Linked antenna {} to mesh entity {:?} (visual: {:?}) for device {}",
+                        antenna_mesh.antenna_name, mesh_entity, antenna_mesh.visual_name, antenna_mesh.device_id
+                    );
+                } else {
+                    tracing::warn!(
+                        "Antenna {} node '{}' found but has no mesh children (visual: {:?}, model: {:?}, device: {})",
+                        antenna_mesh.antenna_name, antenna_mesh.mesh_name, antenna_mesh.visual_name, model_path, antenna_mesh.device_id
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "Antenna {} node '{}' found {} times but none are descendants of visual (visual: {:?}, model: {:?}, device: {})",
+                    antenna_mesh.antenna_name, antenna_mesh.mesh_name, node_entities.len(), antenna_mesh.visual_name, model_path, antenna_mesh.device_id
+                );
+            }
+        } else {
+            let visual_has_tagged_nodes = has_any_tagged_descendant(search_root, &children_query, &node_name_query);
+            if !visual_has_tagged_nodes {
+                remaining.push(antenna_mesh);
+            } else {
+                tracing::warn!(
+                    "Antenna {} mesh '{}' not found in visual's scene graph (visual: {:?}, model: {:?}, device: {})",
+                    antenna_mesh.antenna_name, antenna_mesh.mesh_name, antenna_mesh.visual_name, model_path, antenna_mesh.device_id
                 );
             }
         }
@@ -1603,7 +1975,7 @@ fn has_any_tagged_descendant(
 fn find_child_mesh(
     parent: Entity,
     children_query: &Query<&Children>,
-    mesh_query: &Query<Entity, With<Mesh3d>>,
+    mesh_query: &Query<(Entity, &Mesh3d)>,
 ) -> Option<Entity> {
     if let Ok(children) = children_query.get(parent) {
         for child in children.iter() {
@@ -1629,15 +2001,29 @@ struct OriginalMaterialProps {
 
 /// Update port mesh highlighting with emissive glow based on hover state
 /// Each port mesh gets its own cloned material to avoid affecting other meshes
+/// Also syncs Pickable state with visibility to skip raycasting for hidden ports
 fn update_port_mesh_highlighting(
     mut commands: Commands,
     frame_visibility: Res<FrameVisibility>,
-    port_meshes: Query<(Entity, &PortMeshTarget, Option<&MeshMaterial3d<StandardMaterial>>)>,
+    port_meshes: Query<(Entity, &PortMeshTarget, Option<&MeshMaterial3d<StandardMaterial>>, Option<&Pickable>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut port_materials: Local<HashMap<Entity, (Handle<StandardMaterial>, OriginalMaterialProps)>>,
     mut warned_ports: Local<std::collections::HashSet<String>>,
 ) {
-    for (entity, port_target, material_handle_opt) in port_meshes.iter() {
+    for (entity, port_target, material_handle_opt, pickable_opt) in port_meshes.iter() {
+        let ports_visible = frame_visibility.show_ports_for(&port_target.device_id);
+
+        // Update Pickable state based on visibility to skip raycasting for hidden ports
+        let should_be_pickable = ports_visible;
+        let is_currently_pickable = pickable_opt.map(|p| p.is_hoverable).unwrap_or(false);
+        if should_be_pickable != is_currently_pickable {
+            if should_be_pickable {
+                commands.entity(entity).insert(Pickable::default());
+            } else {
+                commands.entity(entity).insert(Pickable::IGNORE);
+            }
+        }
+
         let Some(material_handle) = material_handle_opt else {
             // Entity has PortMeshTarget but no StandardMaterial - GLTF may use different material
             if warned_ports.insert(port_target.port_name.clone()) {
@@ -1651,7 +2037,6 @@ fn update_port_mesh_highlighting(
 
         let port_key = format!("{}:{}", port_target.device_id, port_target.port_name);
         let is_hovered = frame_visibility.hovered_port.as_ref() == Some(&port_key);
-        let ports_visible = frame_visibility.show_ports_for(&port_target.device_id);
 
         // Ensure this port has its own cloned material (not shared with other meshes)
         let (own_material_handle, original_props) = port_materials.entry(entity).or_insert_with(|| {
@@ -1697,7 +2082,127 @@ fn port_type_to_color(port_type: &str) -> (f32, f32, f32) {
         "i2c" => (0.2, 0.8, 0.8),       // Cyan
         "uart" => (0.8, 0.4, 0.2),      // Orange
         "usb" => (0.2, 0.4, 0.8),       // Blue
-        _ => (0.5, 0.5, 0.5),           // Gray
+        "power" => (1.0, 0.2, 0.2),     // Vibrant red
+        "card" => (0.7, 0.7, 0.4),      // Tan/khaki
+        _ => (1.0, 0.0, 1.0),           // Bright magenta (unknown)
     }
+}
+
+/// Update antenna mesh highlighting based on hover state
+/// Also syncs Pickable state with visibility to skip raycasting for hidden antennas
+fn update_antenna_mesh_highlighting(
+    mut commands: Commands,
+    frame_visibility: Res<FrameVisibility>,
+    antenna_meshes: Query<(Entity, &AntennaMeshTarget, Option<&MeshMaterial3d<StandardMaterial>>, Option<&Pickable>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut antenna_materials: Local<HashMap<Entity, (Handle<StandardMaterial>, OriginalMaterialProps)>>,
+    mut warned_antennas: Local<std::collections::HashSet<String>>,
+) {
+    for (entity, antenna_target, material_handle_opt, pickable_opt) in antenna_meshes.iter() {
+        let antennas_visible = frame_visibility.show_antennas_for(&antenna_target.device_id);
+
+        // Update Pickable state based on visibility to skip raycasting for hidden antennas
+        let should_be_pickable = antennas_visible;
+        let is_currently_pickable = pickable_opt.map(|p| p.is_hoverable).unwrap_or(false);
+        if should_be_pickable != is_currently_pickable {
+            if should_be_pickable {
+                commands.entity(entity).insert(Pickable::default());
+            } else {
+                commands.entity(entity).insert(Pickable::IGNORE);
+            }
+        }
+
+        let Some(material_handle) = material_handle_opt else {
+            if warned_antennas.insert(antenna_target.antenna_name.clone()) {
+                tracing::warn!(
+                    "Antenna mesh {} has no MeshMaterial3d<StandardMaterial>",
+                    antenna_target.antenna_name
+                );
+            }
+            continue;
+        };
+
+        let antenna_key = format!("{}:{}", antenna_target.device_id, antenna_target.antenna_name);
+        let is_hovered = frame_visibility.hovered_antenna.as_ref() == Some(&antenna_key);
+
+        // Ensure this antenna has its own cloned material
+        let (own_material_handle, original_props) = antenna_materials.entry(entity).or_insert_with(|| {
+            if let Some(original_material) = materials.get(&material_handle.0) {
+                let props = OriginalMaterialProps {
+                    base_color: original_material.base_color,
+                    emissive: original_material.emissive,
+                };
+                let cloned = original_material.clone();
+                let handle = materials.add(cloned);
+                commands.entity(entity).insert(MeshMaterial3d(handle.clone()));
+                (handle, props)
+            } else {
+                let props = OriginalMaterialProps {
+                    base_color: Color::srgba(0.5, 0.5, 0.5, 1.0),
+                    emissive: bevy::color::LinearRgba::new(0.0, 0.0, 0.0, 1.0),
+                };
+                (material_handle.0.clone(), props)
+            }
+        });
+
+        if let Some(material) = materials.get_mut(own_material_handle) {
+            if is_hovered && antennas_visible {
+                let (r, g, b) = antenna_type_to_color(&antenna_target.antenna_type);
+                material.base_color = Color::srgba(r, g, b, 1.0);
+                material.emissive = bevy::color::LinearRgba::new(r * 0.3, g * 0.3, b * 0.3, 1.0);
+            } else {
+                material.base_color = original_props.base_color.clone();
+                material.emissive = original_props.emissive;
+            }
+        }
+    }
+}
+
+/// Get highlight color for antenna type as (r, g, b)
+fn antenna_type_to_color(antenna_type: &str) -> (f32, f32, f32) {
+    match antenna_type.to_lowercase().as_str() {
+        "gnss" | "gps" => (0.2, 0.78, 0.4),     // Green (matches UI)
+        "wifi" | "wlan" => (0.2, 0.59, 1.0),    // Blue (matches UI: rgb(50,150,255))
+        "bluetooth" | "bt" => (0.39, 0.39, 1.0), // Blue-purple (matches UI: rgb(100,100,255))
+        "802.15.4" | "wpan" | "zigbee" | "thread" => (0.6, 0.4, 0.2), // Brown/tan for WPAN
+        "lora" => (0.9, 0.5, 0.2),              // Orange
+        "uwb" => (1.0, 0.78, 0.2),              // Yellow-orange (matches UI: rgb(255,200,50))
+        "cellular" | "lte" | "5g" => (1.0, 0.59, 0.2), // Orange (matches UI: rgb(255,150,50))
+        "nfc" => (0.78, 0.39, 0.78),            // Purple (matches UI: rgb(200,100,200))
+        _ => (1.0, 0.0, 0.0),                   // Red (unknown type)
+    }
+}
+
+/// Debug: Log picking-related component status for all port mesh entities
+/// This runs once to help diagnose why some ports aren't pickable
+fn debug_port_mesh_picking_status(
+    port_meshes: Query<(Entity, &PortMeshTarget, Option<&Mesh3d>, Option<&Pickable>, Option<&GlobalTransform>, Option<&Visibility>)>,
+    mut logged: Local<bool>,
+) {
+    // Only log once
+    if *logged {
+        return;
+    }
+
+    // Wait until we have some port meshes
+    if port_meshes.is_empty() {
+        return;
+    }
+
+    *logged = true;
+
+    tracing::warn!("=== PORT MESH PICKING DIAGNOSTIC ===");
+    for (entity, port_target, mesh3d, pickable, gtransform, visibility) in port_meshes.iter() {
+        tracing::warn!(
+            "Port '{}': entity={:?}, has_Mesh3d={}, has_Pickable={}, has_GlobalTransform={}, visibility={:?}",
+            port_target.port_name,
+            entity,
+            mesh3d.is_some(),
+            pickable.is_some(),
+            gtransform.is_some(),
+            visibility.map(|v| format!("{:?}", v)),
+        );
+    }
+    tracing::warn!("=== END DIAGNOSTIC ===");
 }
 

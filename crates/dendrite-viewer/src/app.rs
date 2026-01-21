@@ -78,6 +78,34 @@ pub struct FovData {
     pub geometry: Option<GeometryData>,
 }
 
+/// Port capabilities data - type-specific properties
+#[derive(Debug, Clone, Default)]
+pub struct PortCapabilitiesData {
+    // === Data Capabilities ===
+    /// Network speed (e.g., "1000 Mbps" for ethernet)
+    pub speed: Option<String>,
+    /// Bitrate (e.g., "500000 bps" for CAN)
+    pub bitrate: Option<String>,
+    /// Baud rate (e.g., "115200 baud" for UART)
+    pub baud: Option<String>,
+    /// Physical layer standard (e.g., "1000BASE-T", "1000BASE-T1")
+    pub standard: Option<String>,
+    /// Protocol variants (e.g., ["TSN", "CAN-FD", "PoDL", "PoE+"])
+    pub protocols: Vec<String>,
+
+    // === Power Capabilities ===
+    /// Voltage with range (e.g., "12V (7-28V)")
+    pub voltage: Option<String>,
+    /// Maximum current (e.g., "3A max")
+    pub current: Option<String>,
+    /// Maximum power in watts (e.g., "36W max")
+    pub power_watts: Option<String>,
+    /// Energy capacity for batteries (e.g., "55.5 Wh")
+    pub capacity: Option<String>,
+    /// Physical connector type (e.g., "XT60", "USB-C")
+    pub connector: Option<String>,
+}
+
 /// Port data - physical connection interface
 #[derive(Debug, Clone)]
 pub struct PortData {
@@ -91,6 +119,40 @@ pub struct PortData {
     pub visual_name: Option<String>,
     /// GLTF mesh node name within the visual (e.g., "port_eth0")
     pub mesh_name: Option<String>,
+    /// Port capabilities (speed, bitrate, protocol, etc.)
+    pub capabilities: Option<PortCapabilitiesData>,
+}
+
+/// Antenna capabilities data - type-specific properties for wireless interfaces
+#[derive(Debug, Clone, Default)]
+pub struct AntennaCapabilitiesData {
+    /// Frequency bands (e.g., ["2.4 GHz", "5 GHz"] or ["L1", "L2", "L5"])
+    pub bands: Vec<String>,
+    /// Antenna gain (e.g., "3.5 dBi")
+    pub gain: Option<String>,
+    /// PHY/MAC standards (e.g., ["802.11ax", "802.15.4", "Bluetooth 5.4"])
+    pub standards: Vec<String>,
+    /// Higher-layer protocols (e.g., ["Thread", "6LoWPAN", "Matter"])
+    pub protocols: Vec<String>,
+    /// Polarization (e.g., "RHCP", "linear")
+    pub polarization: Option<String>,
+}
+
+/// Antenna data - wireless connection interface
+#[derive(Debug, Clone)]
+pub struct AntennaData {
+    pub name: String,
+    pub antenna_type: String,
+    /// Pose offset: (x, y, z, roll, pitch, yaw) in meters/radians
+    pub pose: Option<[f64; 6]>,
+    /// Geometry for visualization (fallback if no mesh_name)
+    pub geometry: Option<GeometryData>,
+    /// Reference to visual containing the mesh (e.g., "board")
+    pub visual_name: Option<String>,
+    /// GLTF mesh node name within the visual (e.g., "gnss_antenna")
+    pub mesh_name: Option<String>,
+    /// Antenna capabilities (frequency, gain, protocol, etc.)
+    pub capabilities: Option<AntennaCapabilitiesData>,
 }
 
 /// Sensor data - sensor with pose, axis alignment, and optional FOV geometry
@@ -133,6 +195,8 @@ pub struct DeviceData {
     pub frames: Vec<FrameData>,
     /// Ports on this device
     pub ports: Vec<PortData>,
+    /// Antennas on this device
+    pub antennas: Vec<AntennaData>,
     /// Sensors on this device
     pub sensors: Vec<SensorData>,
     pub last_seen: Option<String>,
@@ -251,6 +315,12 @@ pub struct FrameVisibility {
     pub hovered_port: Option<String>,
     /// Whether the current port hover came from UI (true) or 3D (false)
     pub hovered_port_from_ui: bool,
+    /// Per-device antenna visibility (device_id -> show_antennas)
+    pub device_antennas: std::collections::HashMap<String, bool>,
+    /// Currently hovered antenna (device_id:antenna_name)
+    pub hovered_antenna: Option<String>,
+    /// Whether the current antenna hover came from UI (true) or 3D (false)
+    pub hovered_antenna_from_ui: bool,
     /// Per-sensor axis alignment mode: (device_id, sensor_name) -> show_aligned
     /// Default is true (show aligned), false shows raw physical axes
     pub sensor_axis_aligned: std::collections::HashMap<(String, String), bool>,
@@ -323,6 +393,16 @@ impl FrameVisibility {
     /// Set port visibility for a specific device
     pub fn set_show_ports(&mut self, device_id: &str, show: bool) {
         self.device_ports.insert(device_id.to_string(), show);
+    }
+
+    /// Check if antennas should be shown for a specific device
+    pub fn show_antennas_for(&self, device_id: &str) -> bool {
+        self.device_antennas.get(device_id).copied().unwrap_or(false)
+    }
+
+    /// Set antenna visibility for a specific device
+    pub fn set_show_antennas(&mut self, device_id: &str, show: bool) {
+        self.device_antennas.insert(device_id.to_string(), show);
     }
 
     /// Check if a sensor should show axis-aligned view (default: true)

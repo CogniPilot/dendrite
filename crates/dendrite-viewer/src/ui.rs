@@ -4,7 +4,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, AxisAlignData, CameraSettings, DeviceData, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FovData, FrameData, FrameVisibility, GeometryData, GraphVisualization, PortData, SelectedDevice, SensorData, ShowRotationAxis, TopologyData, TopologyNode, UiLayout, VisualData, WorldSettings};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, AntennaCapabilitiesData, AntennaData, AxisAlignData, CameraSettings, DeviceData, DeviceOrientations, DevicePositions, DeviceRegistry, DeviceStatus, FovData, FrameData, FrameVisibility, GeometryData, GraphVisualization, PortCapabilitiesData, PortData, SelectedDevice, SensorData, ShowRotationAxis, TopologyData, TopologyNode, UiLayout, VisualData, WorldSettings};
 use crate::file_picker::{FileFilter, FilePickerContext, FilePickerState, PendingFileResults, trigger_file_open};
 use dendrite_core::hcdf::Hcdf;
 
@@ -27,9 +27,15 @@ pub struct UiParams<'w, 's> {
     pub graph_vis: ResMut<'w, GraphVisualization>,
     pub pending_removals: ResMut<'w, PendingDeviceRemovals>,
     pub url_input: ResMut<'w, HcdfUrlInput>,
+    pub hosted_mode: Res<'w, HostedMode>,
 }
 
 pub struct UiPlugin;
+
+/// Tracks if running in hosted mode (e.g., dendrite.cognipilot.org)
+/// In hosted mode, local file import is disabled - all data comes via URL
+#[derive(Resource, Default)]
+pub struct HostedMode(pub bool);
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
@@ -38,8 +44,9 @@ impl Plugin for UiPlugin {
             .init_resource::<PendingDeviceRemovals>()
             .init_resource::<HcdfUrlInput>()
             .init_resource::<HcdfBaseUrl>()
+            .init_resource::<HostedMode>()
             // Check URL parameters on startup
-            .add_systems(Startup, check_url_parameters)
+            .add_systems(Startup, (check_url_parameters, detect_hosted_mode))
             // UI layout updates run in Update
             .add_systems(Update, (update_ui_layout, process_file_picker_results, process_device_removals, process_pending_hcdf, process_url_fetch_results))
             // Main UI system runs in EguiPrimaryContextPass for proper input handling (bevy_egui 0.38+)
@@ -127,7 +134,7 @@ fn process_pending_hcdf(
 }
 
 /// Check URL parameters on startup for ?hcdf=URL
-#[allow(unused_variables)]
+#[allow(unused_variables, unused_mut)]
 fn check_url_parameters(mut url_input: ResMut<HcdfUrlInput>) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -150,6 +157,24 @@ fn check_url_parameters(mut url_input: ResMut<HcdfUrlInput>) {
                 // Trigger fetch
                 fetch_hcdf_from_url(&hcdf_url, url_input.pending_result.clone());
                 url_input.loading = true;
+            }
+        }
+    }
+}
+
+/// Detect if running in hosted mode (dendrite.cognipilot.org)
+/// In hosted mode, local file import is disabled
+#[allow(unused_variables, unused_mut)]
+fn detect_hosted_mode(mut hosted_mode: ResMut<HostedMode>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(hostname) = window.location().hostname() {
+                // Check if we're on the production host
+                if hostname == "dendrite.cognipilot.org" {
+                    tracing::info!("Running in hosted mode on {}", hostname);
+                    hosted_mode.0 = true;
+                }
             }
         }
     }
@@ -296,6 +321,7 @@ fn convert_mcu_to_device(mcu: &dendrite_core::hcdf::Mcu) -> DeviceData {
         visuals,
         frames,
         ports: Vec::new(), // MCUs don't have ports in current HCDF schema
+        antennas: Vec::new(), // MCUs don't have antennas in current HCDF schema
         sensors: Vec::new(), // MCUs don't have sensors directly
         last_seen: mcu.discovered.as_ref().and_then(|d| d.last_seen.clone()),
     }
@@ -331,8 +357,47 @@ fn convert_comp_to_device(comp: &dendrite_core::hcdf::Comp) -> DeviceData {
 
     // Convert ports
     let ports: Vec<PortData> = comp.port.iter().map(|p| {
+        // parse_pose handles both fallback_visual.pose and legacy pose field
         let pose = p.parse_pose();
-        let geometry: Vec<GeometryData> = p.geometry.iter().filter_map(|g| convert_geometry(g)).collect();
+
+        // Get geometry from fallback_visual or legacy geometry field
+        let geometry: Vec<GeometryData> = if let Some(ref fv) = p.fallback_visual {
+            // New schema: use fallback_visual geometry
+            fv.geometry.as_ref()
+                .and_then(|g| convert_geometry(g))
+                .map(|g| vec![g])
+                .unwrap_or_default()
+        } else {
+            // Legacy schema: use geometry vector
+            p.geometry.iter().filter_map(|g| convert_geometry(g)).collect()
+        };
+
+        // Extract capabilities
+        let capabilities = p.capabilities.as_ref().map(|caps| {
+            PortCapabilitiesData {
+                // Data capabilities
+                speed: caps.speed.as_ref().map(|v| {
+                    format!("{}{}", v.value, v.unit.as_ref().map(|u| format!(" {}", u)).unwrap_or_default())
+                }),
+                bitrate: caps.bitrate.as_ref().map(|v| {
+                    format!("{}{}", v.value, v.unit.as_ref().map(|u| format!(" {}", u)).unwrap_or_default())
+                }),
+                baud: caps.baud.as_ref().map(|v| {
+                    format!("{}{}", v.value, v.unit.as_ref().map(|u| format!(" {}", u)).unwrap_or_default())
+                }),
+                standard: caps.standard.clone(),
+                protocols: caps.protocol.clone(),
+                // Power capabilities
+                voltage: caps.voltage.as_ref().map(|v| v.to_display_string()).filter(|s| !s.is_empty()),
+                current: caps.current.as_ref().map(|v| v.to_display_string()).filter(|s| !s.is_empty()),
+                power_watts: caps.power.as_ref().map(|v| v.to_display_string()).filter(|s| !s.is_empty()),
+                capacity: caps.capacity.as_ref().map(|v| {
+                    format!("{}{}", v.value, v.unit.as_ref().map(|u| format!(" {}", u)).unwrap_or_default())
+                }),
+                connector: caps.connector.clone(),
+            }
+        });
+
         PortData {
             name: p.name.clone(),
             port_type: p.port_type.clone(),
@@ -340,6 +405,45 @@ fn convert_comp_to_device(comp: &dendrite_core::hcdf::Comp) -> DeviceData {
             geometry,
             visual_name: p.visual.clone(),
             mesh_name: p.mesh.clone(),
+            capabilities,
+        }
+    }).collect();
+
+    // Convert antennas
+    let antennas: Vec<AntennaData> = comp.antenna.iter().map(|a| {
+        // parse_pose handles both fallback_visual.pose and legacy pose field
+        let pose = a.parse_pose();
+
+        // Get geometry from fallback_visual or legacy geometry field
+        let geometry: Option<GeometryData> = if let Some(ref fv) = a.fallback_visual {
+            // New schema: use fallback_visual geometry
+            fv.geometry.as_ref().and_then(|g| convert_geometry(g))
+        } else {
+            // Legacy schema: use geometry field
+            a.geometry.as_ref().and_then(|g| convert_geometry(g))
+        };
+
+        // Extract capabilities
+        let capabilities = a.capabilities.as_ref().map(|caps| {
+            AntennaCapabilitiesData {
+                bands: caps.get_bands(),
+                gain: caps.gain.as_ref().map(|v| {
+                    format!("{}{}", v.value, v.unit.as_ref().map(|u| format!(" {}", u)).unwrap_or_default())
+                }),
+                standards: caps.standard.clone(),
+                protocols: caps.protocol.clone(),
+                polarization: caps.polarization.clone(),
+            }
+        });
+
+        AntennaData {
+            name: a.name.clone(),
+            antenna_type: a.antenna_type.clone(),
+            pose: pose.map(|p| p.to_array()),
+            geometry,
+            visual_name: a.visual.clone(),
+            mesh_name: a.mesh.clone(),
+            capabilities,
         }
     }).collect();
 
@@ -493,6 +597,7 @@ fn convert_comp_to_device(comp: &dendrite_core::hcdf::Comp) -> DeviceData {
         visuals,
         frames,
         ports,
+        antennas,
         sensors,
         last_seen: comp.discovered.as_ref().and_then(|d| d.last_seen.clone()),
     }
@@ -598,6 +703,7 @@ pub struct PendingDeviceRemovals(pub Vec<String>);
 fn process_file_picker_results(
     mut file_picker_state: ResMut<FilePickerState>,
     mut pending_hcdf: ResMut<PendingHcdfContent>,
+    mut base_url: ResMut<HcdfBaseUrl>,
 ) {
     // Process completed file picker results
     while let Some(result) = file_picker_state.take_result() {
@@ -617,6 +723,8 @@ fn process_file_picker_results(
                     if let Ok(xml) = String::from_utf8(content) {
                         tracing::warn!("HCDF file loaded: {} ({} bytes)", result.filename, xml.len());
                         pending_hcdf.0 = Some(xml);
+                        // Clear base_url for local files - models will use default CDN
+                        base_url.0 = None;
                     } else {
                         tracing::error!("HCDF file is not valid UTF-8");
                     }
@@ -735,75 +843,79 @@ fn ui_system(mut params: UiParams) {
                 // Wrap everything in a scroll area so the panel is scrollable
                 egui::ScrollArea::vertical().show(ui, |ui| {
 
-                // File loading - Load HCDF button
-                let button = if is_mobile {
-                    egui::Button::new(egui::RichText::new("Load File").size(16.0 * ui_scale))
-                        .min_size(egui::vec2(0.0, 40.0))
-                } else {
-                    egui::Button::new("Load File")
-                };
-                if ui.add(button).clicked() {
-                    trigger_file_open(
-                        &params.pending_file_results,
-                        FilePickerContext::HcdfImport,
-                        FileFilter::hcdf(),
-                    );
-                }
-
-                // URL input for loading from web
-                ui.add_space(4.0);
-
-                // Calculate fixed width for text input (panel width minus button and padding)
-                let input_width = (panel_width - 60.0).max(80.0);
-
-                ui.horizontal(|ui| {
-                    ui.set_max_width(panel_width);
-
-                    let text_edit = egui::TextEdit::singleline(&mut params.url_input.url)
-                        .hint_text("https://...")
-                        .desired_width(input_width);
-                    let response = ui.add(text_edit);
-
-                    // Fetch button or loading indicator
-                    if params.url_input.loading {
-                        ui.spinner();
+                // File loading UI - only show when NOT in hosted mode
+                // In hosted mode, HCDF is loaded via URL parameters only
+                if !params.hosted_mode.0 {
+                    // File loading - Load HCDF button
+                    let button = if is_mobile {
+                        egui::Button::new(egui::RichText::new("Load File").size(16.0 * ui_scale))
+                            .min_size(egui::vec2(0.0, 40.0))
                     } else {
-                        let fetch_enabled = !params.url_input.url.is_empty()
-                            && (params.url_input.url.starts_with("http://")
-                                || params.url_input.url.starts_with("https://"));
-                        if ui.add_enabled(fetch_enabled, egui::Button::new("Go")).clicked() {
-                            fetch_hcdf_from_url(&params.url_input.url, params.url_input.pending_result.clone());
-                            params.url_input.loading = true;
-                            params.url_input.error = None;
-                        }
+                        egui::Button::new("Load File")
+                    };
+                    if ui.add(button).clicked() {
+                        trigger_file_open(
+                            &params.pending_file_results,
+                            FilePickerContext::HcdfImport,
+                            FileFilter::hcdf(),
+                        );
                     }
 
-                    // Also fetch on Enter key
-                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if !params.url_input.url.is_empty() && !params.url_input.loading {
-                            fetch_hcdf_from_url(&params.url_input.url, params.url_input.pending_result.clone());
-                            params.url_input.loading = true;
-                            params.url_input.error = None;
-                        }
-                    }
-                });
+                    // URL input for loading from web
+                    ui.add_space(4.0);
 
-                // Show error if any
-                if let Some(ref error) = params.url_input.error {
+                    // Calculate fixed width for text input (panel width minus button and padding)
+                    let input_width = (panel_width - 60.0).max(80.0);
+
+                    ui.horizontal(|ui| {
+                        ui.set_max_width(panel_width);
+
+                        let text_edit = egui::TextEdit::singleline(&mut params.url_input.url)
+                            .hint_text("https://...")
+                            .desired_width(input_width);
+                        let response = ui.add(text_edit);
+
+                        // Fetch button or loading indicator
+                        if params.url_input.loading {
+                            ui.spinner();
+                        } else {
+                            let fetch_enabled = !params.url_input.url.is_empty()
+                                && (params.url_input.url.starts_with("http://")
+                                    || params.url_input.url.starts_with("https://"));
+                            if ui.add_enabled(fetch_enabled, egui::Button::new("Go")).clicked() {
+                                fetch_hcdf_from_url(&params.url_input.url, params.url_input.pending_result.clone());
+                                params.url_input.loading = true;
+                                params.url_input.error = None;
+                            }
+                        }
+
+                        // Also fetch on Enter key
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            if !params.url_input.url.is_empty() && !params.url_input.loading {
+                                fetch_hcdf_from_url(&params.url_input.url, params.url_input.pending_result.clone());
+                                params.url_input.loading = true;
+                                params.url_input.error = None;
+                            }
+                        }
+                    });
+
+                    // Show error if any
+                    if let Some(ref error) = params.url_input.error {
+                        ui.label(
+                            egui::RichText::new(error)
+                                .size(10.0 * ui_scale)
+                                .color(egui::Color32::from_rgb(255, 100, 100))
+                        );
+                    }
+
                     ui.label(
-                        egui::RichText::new(error)
-                            .size(10.0 * ui_scale)
-                            .color(egui::Color32::from_rgb(255, 100, 100))
-                    );
-                }
-
-                ui.label(
-                    egui::RichText::new("Load .hcdf from file or URL")
-                        .size(11.0 * ui_scale)
+                        egui::RichText::new("Load .hcdf from file or URL")
+                            .size(11.0 * ui_scale)
                         .color(egui::Color32::GRAY)
-                );
+                    );
 
-                ui.separator();
+                    ui.separator();
+                } // end if !hosted_mode
 
                 // Device list
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -866,35 +978,37 @@ fn ui_system(mut params: UiParams) {
 
                 ui.separator();
 
-                // HCDF Import - collapsible section
-                egui::CollapsingHeader::new(egui::RichText::new("HCDF Configuration").size(14.0 * ui_scale))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        // Import button
-                        ui.horizontal(|ui| {
-                            let import_button = if is_mobile {
-                                egui::Button::new(egui::RichText::new("Import").size(14.0 * ui_scale))
-                                    .min_size(egui::vec2(0.0, 32.0))
-                            } else {
-                                egui::Button::new("Import")
-                            };
-                            if ui.add(import_button).clicked() {
-                                tracing::warn!("Import button clicked, triggering file picker");
-                                trigger_file_open(
-                                    &params.pending_file_results,
-                                    FilePickerContext::HcdfImport,
-                                    FileFilter::hcdf(),
+                // HCDF Import - collapsible section (only in non-hosted mode)
+                if !params.hosted_mode.0 {
+                    egui::CollapsingHeader::new(egui::RichText::new("HCDF Configuration").size(14.0 * ui_scale))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            // Import button
+                            ui.horizontal(|ui| {
+                                let import_button = if is_mobile {
+                                    egui::Button::new(egui::RichText::new("Import").size(14.0 * ui_scale))
+                                        .min_size(egui::vec2(0.0, 32.0))
+                                } else {
+                                    egui::Button::new("Import")
+                                };
+                                if ui.add(import_button).clicked() {
+                                    tracing::warn!("Import button clicked, triggering file picker");
+                                    trigger_file_open(
+                                        &params.pending_file_results,
+                                        FilePickerContext::HcdfImport,
+                                        FileFilter::hcdf(),
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new("Load .hcdf file")
+                                        .size(10.0 * ui_scale)
+                                        .color(egui::Color32::GRAY)
                                 );
-                            }
-                            ui.label(
-                                egui::RichText::new("Load .hcdf file")
-                                    .size(10.0 * ui_scale)
-                                    .color(egui::Color32::GRAY)
-                            );
+                            });
                         });
-                    });
 
-                ui.separator();
+                    ui.separator();
+                }
 
                 // World Settings - collapsible section
                 egui::CollapsingHeader::new(egui::RichText::new("World Settings").size(14.0 * ui_scale))
@@ -1556,7 +1670,9 @@ fn ui_system(mut params: UiParams) {
                                                 "i2c" => egui::Color32::from_rgb(50, 200, 200),
                                                 "uart" => egui::Color32::from_rgb(200, 100, 50),
                                                 "usb" => egui::Color32::from_rgb(50, 100, 200),
-                                                _ => egui::Color32::GRAY,
+                                                "power" => egui::Color32::from_rgb(255, 50, 50),  // Vibrant red
+                                                "card" => egui::Color32::from_rgb(180, 180, 100), // Tan/khaki
+                                                _ => egui::Color32::from_rgb(255, 0, 255),        // Bright magenta (unknown)
                                             };
                                             // Highlight text if hovered (either from UI or 3D view)
                                             let display_color = if is_hovered {
@@ -1594,6 +1710,79 @@ fn ui_system(mut params: UiParams) {
                                             if hovered.starts_with(&format!("{}:", id)) {
                                                 params.frame_visibility.hovered_port = None;
                                                 params.frame_visibility.hovered_port_from_ui = false;
+                                            }
+                                        }
+                                    }
+                                }
+                                ui.separator();
+                            }
+
+                            // Per-device antenna visibility toggle (only if device has antennas)
+                            if !device.antennas.is_empty() {
+                                let mut show_antennas = params.frame_visibility.show_antennas_for(&id);
+                                if ui.checkbox(&mut show_antennas, "Show Antennas").changed() {
+                                    params.frame_visibility.set_show_antennas(&id, show_antennas);
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("{} antenna(s)", device.antennas.len()))
+                                        .size(11.0 * ui_scale)
+                                        .color(egui::Color32::GRAY)
+                                );
+
+                                // Show antenna details when enabled
+                                if show_antennas {
+                                    let mut any_antenna_hovered = false;
+                                    ui.indent("antennas", |ui| {
+                                        for antenna in &device.antennas {
+                                            let antenna_key = format!("{}:{}", id, antenna.name);
+                                            let is_hovered = params.frame_visibility.hovered_antenna.as_ref() == Some(&antenna_key);
+                                            let antenna_color = match antenna.antenna_type.to_lowercase().as_str() {
+                                                "wifi" | "wlan" => egui::Color32::from_rgb(50, 150, 255),
+                                                "bluetooth" | "bt" => egui::Color32::from_rgb(100, 100, 255),
+                                                "gnss" | "gps" => egui::Color32::from_rgb(50, 200, 100),
+                                                "cellular" | "lte" | "5g" => egui::Color32::from_rgb(255, 150, 50),
+                                                "nfc" => egui::Color32::from_rgb(200, 100, 200),
+                                                "uwb" => egui::Color32::from_rgb(255, 200, 50),
+                                                "lora" => egui::Color32::from_rgb(230, 128, 50),
+                                                "802.15.4" | "wpan" | "zigbee" | "thread" => egui::Color32::from_rgb(153, 102, 51), // Brown/tan for WPAN
+                                                _ => egui::Color32::from_rgb(255, 0, 0), // Red (unknown)
+                                            };
+                                            // Highlight text if hovered (either from UI or 3D view)
+                                            let display_color = if is_hovered {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                antenna_color
+                                            };
+
+                                            // Build antenna label text
+                                            let label_text = format!("{} ({})", antenna.name, antenna.antenna_type);
+
+                                            // Use selectable_label for built-in hover detection
+                                            let response = ui.selectable_label(
+                                                is_hovered,
+                                                egui::RichText::new(&label_text)
+                                                    .size(12.0 * ui_scale)
+                                                    .color(display_color)
+                                            );
+
+                                            // Set hovered_antenna when hovering over antenna name in UI
+                                            if response.hovered() {
+                                                params.frame_visibility.hovered_antenna = Some(antenna_key);
+                                                params.frame_visibility.hovered_antenna_from_ui = true;
+                                                any_antenna_hovered = true;
+                                            }
+                                        }
+                                    });
+
+                                    // Clear hovered_antenna only if:
+                                    // 1. No antenna in this UI list is hovered, AND
+                                    // 2. The hover was set by UI (not 3D), AND
+                                    // 3. The currently hovered antenna belongs to this device
+                                    if !any_antenna_hovered && params.frame_visibility.hovered_antenna_from_ui {
+                                        if let Some(ref hovered) = params.frame_visibility.hovered_antenna.clone() {
+                                            if hovered.starts_with(&format!("{}:", id)) {
+                                                params.frame_visibility.hovered_antenna = None;
+                                                params.frame_visibility.hovered_antenna_from_ui = false;
                                             }
                                         }
                                     }

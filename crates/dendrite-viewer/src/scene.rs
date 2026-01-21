@@ -8,8 +8,8 @@ use bevy::camera::primitives::MeshAabb;  // Trait for compute_aabb
 use bevy_egui::{egui, EguiContexts};
 use bevy_picking::prelude::{Click, Out, Over, Pointer, PointerButton};
 
-use crate::app::{ActiveRotationAxis, ActiveRotationField, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, SelectedDevice, ShowRotationAxis, UiLayout, WorldSettings};
-use crate::models::{ExcludeFromBounds, PortEntity, PortMeshTarget, SensorAxisEntity, SensorFovEntity};
+use crate::app::{ActiveRotationAxis, ActiveRotationField, AntennaCapabilitiesData, CameraSettings, DeviceOrientations, DevicePositions, DeviceRegistry, FrameVisibility, PortCapabilitiesData, SelectedDevice, ShowRotationAxis, UiLayout, WorldSettings};
+use crate::models::{AntennaEntity, AntennaMeshTarget, ExcludeFromBounds, PortEntity, PortMeshTarget, SensorAxisEntity, SensorFovEntity};
 
 /// Marker component for the main directional light (for shadow control)
 #[derive(Component)]
@@ -34,9 +34,11 @@ impl Plugin for ScenePlugin {
                 render_sensor_axis_tooltip,
                 render_sensor_fov_tooltip,
                 render_port_tooltip,
+                render_antenna_tooltip,
                 adjust_shadows_for_mobile,
             ))
             // Use observers for picking events (Bevy 0.17 pattern)
+            .add_observer(debug_all_hover_events)
             .add_observer(on_device_clicked)
             .add_observer(on_frame_gizmo_over)
             .add_observer(on_frame_gizmo_out)
@@ -49,8 +51,33 @@ impl Plugin for ScenePlugin {
             .add_observer(on_frame_gizmo_click)
             .add_observer(on_port_over)
             .add_observer(on_port_out)
-            .add_observer(on_port_click);
+            .add_observer(on_port_click)
+            .add_observer(on_antenna_over)
+            .add_observer(on_antenna_out)
+            .add_observer(on_antenna_click);
     }
+}
+
+/// Debug observer: Log ALL hover events to understand what's being picked
+fn debug_all_hover_events(
+    trigger: On<Pointer<Over>>,
+    name_query: Query<&Name>,
+    port_mesh_query: Query<&PortMeshTarget>,
+    mesh_query: Query<&Mesh3d>,
+    camera_query: Query<&Camera>,
+    transform_query: Query<&GlobalTransform>,
+) {
+    let entity = trigger.event().entity;
+    let name = name_query.get(entity).map(|n| n.as_str()).unwrap_or("unnamed");
+    let is_port_mesh = port_mesh_query.get(entity).is_ok();
+    let has_mesh = mesh_query.get(entity).is_ok();
+    let is_camera = camera_query.get(entity).is_ok();
+    let pos = transform_query.get(entity).map(|t| t.translation()).unwrap_or_default();
+
+    tracing::warn!(
+        "DEBUG HOVER: entity {:?}, name='{}', is_port_mesh={}, has_mesh={}, is_camera={}, pos=({:.3}, {:.3}, {:.3})",
+        entity, name, is_port_mesh, has_mesh, is_camera, pos.x, pos.y, pos.z
+    );
 }
 
 /// Observer: Handle device selection when clicked using bevy_picking
@@ -1887,6 +1914,7 @@ fn on_port_over(
     // Check PortEntity (fallback geometry)
     if let Ok(port) = port_query.get(entity) {
         let port_key = format!("{}:{}", port.device_id, port.port_name);
+        tracing::warn!("Port hover (PortEntity): {:?} -> {}", entity, port_key);
         frame_visibility.hovered_port = Some(port_key);
         frame_visibility.hovered_port_from_ui = false;
         return;
@@ -1895,6 +1923,7 @@ fn on_port_over(
     // Check PortMeshTarget (GLTF mesh-based ports)
     if let Ok(port_mesh) = port_mesh_query.get(entity) {
         let port_key = format!("{}:{}", port_mesh.device_id, port_mesh.port_name);
+        tracing::warn!("Port hover (PortMeshTarget): {:?} -> {}", entity, port_key);
         frame_visibility.hovered_port = Some(port_key);
         frame_visibility.hovered_port_from_ui = false;
     }
@@ -1947,6 +1976,8 @@ fn on_port_click(
             frame_visibility.hovered_sensor_fov_from_click = false;
             frame_visibility.hovered_frame = None;
             frame_visibility.hovered_frame_from_click = false;
+            frame_visibility.hovered_antenna = None;
+            frame_visibility.hovered_antenna_from_ui = false;
         }
         return;
     }
@@ -1966,6 +1997,8 @@ fn on_port_click(
             frame_visibility.hovered_sensor_fov_from_click = false;
             frame_visibility.hovered_frame = None;
             frame_visibility.hovered_frame_from_click = false;
+            frame_visibility.hovered_antenna = None;
+            frame_visibility.hovered_antenna_from_ui = false;
         }
     }
 }
@@ -1985,6 +2018,7 @@ fn render_port_tooltip(
     // Find the port entity with matching key (check both PortEntity and PortMeshTarget)
     let mut port_name = String::new();
     let mut port_type = String::new();
+    let mut capabilities: Option<PortCapabilitiesData> = None;
 
     // Check PortEntity (fallback geometry)
     for port in port_query.iter() {
@@ -1992,6 +2026,7 @@ fn render_port_tooltip(
         if &key == hovered_key {
             port_name = port.port_name.clone();
             port_type = port.port_type.clone();
+            capabilities = port.capabilities.clone();
             break;
         }
     }
@@ -2003,6 +2038,7 @@ fn render_port_tooltip(
             if &key == hovered_key {
                 port_name = port_mesh.port_name.clone();
                 port_type = port_mesh.port_type.clone();
+                capabilities = port_mesh.capabilities.clone();
                 break;
             }
         }
@@ -2042,6 +2078,276 @@ fn render_port_tooltip(
                         _ => egui::Color32::GRAY,
                     };
                     ui.label(egui::RichText::new(&port_type).color(type_color));
+
+                    // Display capabilities if available
+                    if let Some(ref caps) = capabilities {
+                        // Data capabilities section
+                        let has_data_caps = caps.speed.is_some() || caps.bitrate.is_some()
+                            || caps.baud.is_some() || caps.standard.is_some() || !caps.protocols.is_empty();
+                        if has_data_caps {
+                            ui.separator();
+                            if let Some(ref speed) = caps.speed {
+                                ui.label(format!("Speed: {}", speed));
+                            }
+                            if let Some(ref bitrate) = caps.bitrate {
+                                ui.label(format!("Bitrate: {}", bitrate));
+                            }
+                            if let Some(ref baud) = caps.baud {
+                                ui.label(format!("Baud: {}", baud));
+                            }
+                            if let Some(ref standard) = caps.standard {
+                                ui.label(format!("Standard: {}", standard));
+                            }
+                            if !caps.protocols.is_empty() {
+                                let label = if caps.protocols.len() == 1 { "Protocol" } else { "Protocols" };
+                                ui.label(format!("{}: {}", label, caps.protocols.join(", ")));
+                            }
+                        }
+
+                        // Power capabilities section
+                        let has_power_caps = caps.voltage.is_some() || caps.current.is_some()
+                            || caps.power_watts.is_some() || caps.capacity.is_some() || caps.connector.is_some();
+                        if has_power_caps {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Power").small().color(egui::Color32::GRAY));
+                            if let Some(ref voltage) = caps.voltage {
+                                ui.label(format!("Voltage: {}", voltage));
+                            }
+                            if let Some(ref current) = caps.current {
+                                ui.label(format!("Current: {}", current));
+                            }
+                            if let Some(ref power_watts) = caps.power_watts {
+                                ui.label(format!("Power: {}", power_watts));
+                            }
+                            if let Some(ref capacity) = caps.capacity {
+                                ui.label(format!("Capacity: {}", capacity));
+                            }
+                            if let Some(ref connector) = caps.connector {
+                                ui.label(format!("Connector: {}", connector));
+                            }
+                        }
+                    }
+                });
+        });
+}
+
+/// Observer: Handle mouse entering an antenna geometry
+fn on_antenna_over(
+    trigger: On<Pointer<Over>>,
+    antenna_query: Query<&AntennaEntity>,
+    antenna_mesh_query: Query<&AntennaMeshTarget>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    // Check AntennaEntity (fallback geometry)
+    if let Ok(antenna) = antenna_query.get(entity) {
+        // Only respond to hover if antennas are shown for this device
+        if !frame_visibility.show_antennas_for(&antenna.device_id) {
+            return;
+        }
+        let antenna_key = format!("{}:{}", antenna.device_id, antenna.antenna_name);
+        frame_visibility.hovered_antenna = Some(antenna_key);
+        frame_visibility.hovered_antenna_from_ui = false;
+        return;
+    }
+
+    // Check AntennaMeshTarget (GLTF mesh-based antennas)
+    if let Ok(antenna_mesh) = antenna_mesh_query.get(entity) {
+        // Only respond to hover if antennas are shown for this device
+        if !frame_visibility.show_antennas_for(&antenna_mesh.device_id) {
+            return;
+        }
+        let antenna_key = format!("{}:{}", antenna_mesh.device_id, antenna_mesh.antenna_name);
+        frame_visibility.hovered_antenna = Some(antenna_key);
+        frame_visibility.hovered_antenna_from_ui = false;
+    }
+}
+
+/// Observer: Handle mouse leaving an antenna geometry
+fn on_antenna_out(
+    trigger: On<Pointer<Out>>,
+    antenna_query: Query<&AntennaEntity>,
+    antenna_mesh_query: Query<&AntennaMeshTarget>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let entity = trigger.event().entity;
+
+    // Only clear if this is an antenna entity AND hover wasn't set by UI or click
+    let is_antenna = antenna_query.get(entity).is_ok() || antenna_mesh_query.get(entity).is_ok();
+    if is_antenna && !frame_visibility.hovered_antenna_from_ui {
+        frame_visibility.hovered_antenna = None;
+    }
+}
+
+/// Observer: Handle click/tap on an antenna (for touch-friendly sticky selection)
+fn on_antenna_click(
+    trigger: On<Pointer<Click>>,
+    antenna_query: Query<&AntennaEntity>,
+    antenna_mesh_query: Query<&AntennaMeshTarget>,
+    mut frame_visibility: ResMut<FrameVisibility>,
+) {
+    let event = trigger.event();
+    if event.button != PointerButton::Primary {
+        return;
+    }
+
+    let entity = event.entity;
+
+    // Check AntennaEntity (fallback geometry)
+    if let Ok(antenna) = antenna_query.get(entity) {
+        // Only respond to click if antennas are shown for this device
+        if !frame_visibility.show_antennas_for(&antenna.device_id) {
+            return;
+        }
+        let antenna_key = format!("{}:{}", antenna.device_id, antenna.antenna_name);
+        // Toggle: if clicking the same antenna, deselect; otherwise select new one
+        if frame_visibility.hovered_antenna.as_ref() == Some(&antenna_key) && frame_visibility.hovered_antenna_from_ui {
+            frame_visibility.hovered_antenna = None;
+            frame_visibility.hovered_antenna_from_ui = false;
+        } else {
+            frame_visibility.hovered_antenna = Some(antenna_key);
+            frame_visibility.hovered_antenna_from_ui = true;
+            // Clear other sticky selections
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+            frame_visibility.hovered_port = None;
+            frame_visibility.hovered_port_from_ui = false;
+        }
+        return;
+    }
+
+    // Check AntennaMeshTarget (GLTF mesh-based antennas)
+    if let Ok(antenna_mesh) = antenna_mesh_query.get(entity) {
+        // Only respond to click if antennas are shown for this device
+        if !frame_visibility.show_antennas_for(&antenna_mesh.device_id) {
+            return;
+        }
+        let antenna_key = format!("{}:{}", antenna_mesh.device_id, antenna_mesh.antenna_name);
+        // Toggle: if clicking the same antenna, deselect; otherwise select new one
+        if frame_visibility.hovered_antenna.as_ref() == Some(&antenna_key) && frame_visibility.hovered_antenna_from_ui {
+            frame_visibility.hovered_antenna = None;
+            frame_visibility.hovered_antenna_from_ui = false;
+        } else {
+            frame_visibility.hovered_antenna = Some(antenna_key);
+            frame_visibility.hovered_antenna_from_ui = true;
+            // Clear other sticky selections
+            frame_visibility.hovered_sensor_axis = None;
+            frame_visibility.hovered_sensor_axis_from_click = false;
+            frame_visibility.hovered_sensor_fov = None;
+            frame_visibility.hovered_sensor_fov_from_click = false;
+            frame_visibility.hovered_frame = None;
+            frame_visibility.hovered_frame_from_click = false;
+            frame_visibility.hovered_port = None;
+            frame_visibility.hovered_port_from_ui = false;
+        }
+    }
+}
+
+/// Render tooltip for hovered antenna using egui
+fn render_antenna_tooltip(
+    mut contexts: EguiContexts,
+    frame_visibility: Res<FrameVisibility>,
+    antenna_query: Query<&AntennaEntity>,
+    antenna_mesh_query: Query<&AntennaMeshTarget>,
+    ui_layout: Res<UiLayout>,
+) {
+    let Some(ref hovered_key) = frame_visibility.hovered_antenna else {
+        return;
+    };
+
+    // Find the antenna entity with matching key
+    // Check both AntennaEntity (fallback geometry) and AntennaMeshTarget (GLTF mesh)
+    let mut antenna_name = String::new();
+    let mut antenna_type = String::new();
+    let mut capabilities: Option<AntennaCapabilitiesData> = None;
+
+    // First check AntennaEntity (fallback geometry-based antennas)
+    for antenna in antenna_query.iter() {
+        let key = format!("{}:{}", antenna.device_id, antenna.antenna_name);
+        if &key == hovered_key {
+            antenna_name = antenna.antenna_name.clone();
+            antenna_type = antenna.antenna_type.clone();
+            capabilities = antenna.capabilities.clone();
+            break;
+        }
+    }
+
+    // If not found, check AntennaMeshTarget (GLTF mesh-based antennas)
+    if antenna_name.is_empty() {
+        for antenna in antenna_mesh_query.iter() {
+            let key = format!("{}:{}", antenna.device_id, antenna.antenna_name);
+            if &key == hovered_key {
+                antenna_name = antenna.antenna_name.clone();
+                antenna_type = antenna.antenna_type.clone();
+                capabilities = antenna.capabilities.clone();
+                break;
+            }
+        }
+    }
+
+    if antenna_name.is_empty() {
+        return;
+    }
+
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    // On mobile/touch, show tooltip as a card at top of screen to avoid finger occlusion
+    let tooltip_pos = if ui_layout.is_mobile {
+        egui::pos2(ui_layout.screen_width / 2.0 - 60.0, 60.0)
+    } else if let Some(pos) = ctx.pointer_hover_pos() {
+        egui::pos2(pos.x + 15.0, pos.y + 15.0)
+    } else {
+        return;
+    };
+
+    egui::Area::new(egui::Id::new("antenna_tooltip"))
+        .fixed_pos(tooltip_pos)
+        .order(egui::Order::Tooltip)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_min_width(100.0);
+                    ui.label(egui::RichText::new(&antenna_name).strong());
+                    // Color the antenna type
+                    let type_color = match antenna_type.to_lowercase().as_str() {
+                        "gnss" | "gps" => egui::Color32::from_rgb(50, 150, 255),     // Light blue
+                        "wifi" => egui::Color32::from_rgb(100, 200, 100),             // Light green
+                        "bluetooth" | "bt" => egui::Color32::from_rgb(100, 100, 255), // Blue
+                        "lora" => egui::Color32::from_rgb(255, 150, 50),              // Orange
+                        "cellular" | "lte" | "5g" => egui::Color32::from_rgb(255, 100, 100), // Red
+                        "uwb" => egui::Color32::from_rgb(200, 100, 200),              // Purple
+                        "nfc" => egui::Color32::from_rgb(150, 200, 255),              // Light cyan
+                        _ => egui::Color32::GRAY,
+                    };
+                    ui.label(egui::RichText::new(&antenna_type).color(type_color));
+
+                    // Display capabilities if available
+                    if let Some(ref caps) = capabilities {
+                        ui.separator();
+                        if !caps.bands.is_empty() {
+                            let label = if caps.bands.len() == 1 { "Band" } else { "Bands" };
+                            ui.label(format!("{}: {}", label, caps.bands.join(", ")));
+                        }
+                        if let Some(ref gain) = caps.gain {
+                            ui.label(format!("Gain: {}", gain));
+                        }
+                        if !caps.standards.is_empty() {
+                            let label = if caps.standards.len() == 1 { "Standard" } else { "Standards" };
+                            ui.label(format!("{}: {}", label, caps.standards.join(", ")));
+                        }
+                        if !caps.protocols.is_empty() {
+                            let label = if caps.protocols.len() == 1 { "Protocol" } else { "Protocols" };
+                            ui.label(format!("{}: {}", label, caps.protocols.join(", ")));
+                        }
+                        if let Some(ref polarization) = caps.polarization {
+                            ui.label(format!("Polarization: {}", polarization));
+                        }
+                    }
                 });
         });
 }
